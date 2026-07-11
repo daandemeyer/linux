@@ -12,6 +12,31 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 
+enum copy_file_range_role {
+	COPY_FILE_RANGE_SOURCE,
+	COPY_FILE_RANGE_DESTINATION,
+};
+
+enum copy_file_range_resolve_mode {
+	COPY_FILE_RANGE_RESOLVE_CACHED,
+	COPY_FILE_RANGE_RESOLVE_MAY_OPEN,
+};
+
+/*
+ * Files with the same table and no copy_file_range method form a paired
+ * layer.  An identical copy_file_range method takes precedence.
+ */
+struct copy_file_range_layer_operations {
+	struct file *(*resolve)(struct file *file,
+				enum copy_file_range_role role,
+				enum copy_file_range_resolve_mode mode);
+	int (*prepare_write)(struct file *file, struct file *next);
+	void (*finish_write)(struct file *file, struct file *next,
+			     loff_t pos_out, ssize_t ret);
+	/* Synchronize source state after a backing splice attempt. */
+	void (*sync_source_access)(struct file *file);
+};
+
 struct backing_file_ctx {
 	const struct cred *cred;
 	void (*accessed)(struct file *file);
