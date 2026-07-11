@@ -1301,6 +1301,10 @@ static inline struct fuse_backing *fuse_inode_backing_set(struct fuse_inode *fi,
 
 struct fuse_backing *fuse_passthrough_open(struct file *file, int backing_id);
 void fuse_passthrough_release(struct fuse_file *ff, struct fuse_backing *fb);
+#ifdef CONFIG_FUSE_PASSTHROUGH
+extern const struct copy_file_range_layer_operations
+	fuse_passthrough_copy_file_range_layer_ops;
+#endif
 
 static inline struct file *fuse_file_passthrough(struct fuse_file *ff)
 {
