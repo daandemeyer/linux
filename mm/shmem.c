@@ -5148,6 +5148,7 @@ static const struct file_operations shmem_file_operations = {
 	.splice_write	= iter_file_splice_write,
 	.fallocate	= shmem_fallocate,
 	.setlease	= generic_setlease,
+	.fop_flags	= FOP_COPY_FILE_RANGE_BACKING,
 #endif
 };
 
