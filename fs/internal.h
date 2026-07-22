@@ -274,6 +274,12 @@ ssize_t splice_file_to_pipe(struct file *in,
 			    struct pipe_inode_info *opipe,
 			    loff_t *offset,
 			    size_t len, unsigned int flags);
+ssize_t file_range_splice_read(struct file *in, loff_t *ppos,
+			       struct pipe_inode_info *pipe, size_t len,
+			       unsigned int flags);
+ssize_t file_range_splice_write(struct pipe_inode_info *pipe,
+				struct file *out, loff_t *ppos, size_t len,
+				unsigned int flags);
 
 /*
  * fs/xattr.c:

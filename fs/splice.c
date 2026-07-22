@@ -917,23 +917,13 @@ out:
 }
 #endif
 
-static int warn_unsupported(struct file *file, const char *op)
-{
-	pr_debug_ratelimited(
-		"splice %s not supported for file %pD4 (pid: %d comm: %.20s)\n",
-		op, file, current->pid, current->comm);
-	return -EINVAL;
-}
-
 /*
  * Attempt to initiate a splice from pipe to file.
  */
 static ssize_t do_splice_from(struct pipe_inode_info *pipe, struct file *out,
 			      loff_t *ppos, size_t len, unsigned int flags)
 {
-	if (unlikely(!out->f_op->splice_write))
-		return warn_unsupported(out, "write");
-	return out->f_op->splice_write(pipe, out, ppos, len, flags);
+	return file_range_splice_write(pipe, out, ppos, len, flags);
 }
 
 /*
@@ -969,15 +959,7 @@ static ssize_t do_splice_read(struct file *in, loff_t *ppos,
 	if (unlikely(len > MAX_RW_COUNT))
 		len = MAX_RW_COUNT;
 
-	if (unlikely(!in->f_op->splice_read))
-		return warn_unsupported(in, "read");
-	/*
-	 * O_DIRECT and DAX don't deal with the pagecache, so we allocate a
-	 * buffer, copy into it and splice that into the pipe.
-	 */
-	if ((in->f_flags & O_DIRECT) || IS_DAX(in->f_mapping->host))
-		return copy_splice_read(in, ppos, pipe, len, flags);
-	return in->f_op->splice_read(in, ppos, pipe, len, flags);
+	return file_range_splice_read(in, ppos, pipe, len, flags);
 }
 
 /**
@@ -1047,7 +1029,6 @@ ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
 		pipe = alloc_pipe_info();
 		if (!pipe)
 			return -ENOMEM;
-
 		/*
 		 * We don't have an immediate reader, but we'll read the stuff
 		 * out of the pipe right after the splice_to_pipe(). So set

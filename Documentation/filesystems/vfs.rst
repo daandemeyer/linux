@@ -1151,12 +1151,13 @@ otherwise noted.
 
 ``file_range_layer_ops``
 	describes how one stackable filesystem layer participates in
-	``copy_file_range``, clone, and dedupe operations.  ``supported_operations``
+	``copy_file_range``, clone, dedupe, and splice operations.
+	``supported_operations``
 	explicitly selects the operations which may traverse the layer.  A file
 	without this operations table is a terminal endpoint.  Resolution may
 	traverse multiple layers synchronously, and the
 	same ``resolve`` method is used for source and destination endpoints.  The
-	``operation`` identifies copy, clone, or dedupe and ``role`` identifies
+	``operation`` identifies copy, clone, dedupe, or splice and ``role`` identifies
 	whether the returned backing file will be read or written.
 
 	On success, ``resolve`` must return a referenced, already-open regular file
@@ -1167,6 +1168,11 @@ otherwise noted.
 	dedupe, whose ownership and write-permission rules allow a read-only file.
 	Every transition must reduce ``s_stack_depth`` and must not return a file
 	already present in the endpoint chain.
+
+	For splice only, ``resolve`` may return ``-EOPNOTSUPP`` to make the current
+	file an opaque endpoint and dispatch its ordinary ``splice_read`` or
+	``splice_write`` method.  This supports filesystems which select backing-file
+	passthrough per open file.  Other errors abort the operation.
 
 	The backing file must use identity offset mapping: byte offset N in the
 	wrapper denotes byte offset N in the returned file.  Source size and EOF
@@ -1185,8 +1191,10 @@ otherwise noted.
 	authorization.  Copy uses it only for a nonempty request.  Clone may use it
 	for a zero length because zero means through the end of the source file.  It
 	is also used for zero-length dedupe so that terminal compatibility and
-	backing authorization are preserved.  It is called without a write freeze
-	or inode lock held.  It may establish
+	backing authorization are preserved.  Splice also uses this mode after the
+	logical endpoint has passed authorization; a destination splice already has
+	its logical write freeze held.  The callback is called without an inode lock.
+	It may establish
 	transient per-open or cached state, including opening an existing backing
 	object, but must not copy up data or change file data, ``i_size``, the
 	namespace, or persistent metadata.  Backing-file range authorization has not
@@ -1194,15 +1202,15 @@ otherwise noted.
 
 	The first resolver is called with the caller's credentials.  A nested
 	resolver is called with the pinned ``f_cred`` of its current backing file.
-	The VFS also uses each returned file's ``f_cred`` for that file's backing
-	``rw_verify_area`` or ``remap_verify_area`` check.  Destination execution
+	The VFS also uses each returned file's ``f_cred`` for backing range checks
+	and splice source authorization.  Destination execution
 	changes credentials at each edge, so the terminal operation runs with the
 	innermost destination file's ``f_cred``; a request with no destination
 	translation runs with the caller's credentials.  Implementations must
 	therefore return files whose open credentials remain valid for these
 	operations.
 
-	After all logical and backing checks, the VFS probes each destination edge
+	After the required logical and backing checks, the VFS probes each destination edge
 	again and requires it to return the same file.  The retained source file is
 	the selected backing object; source resolution is not repeated because it
 	would not prevent a later source copy-up.  For a destination layer,
@@ -1219,11 +1227,22 @@ otherwise noted.
 	synchronize wrapper state and release the retained lock or other state.
 	Layers are finished from the inside out.
 
-	The VFS, rather than a wrapper range method, owns this recursion so each
+	The VFS, rather than a wrapper method, owns this recursion so each
 	wrapper destination write freeze is acquired once and no destination freeze
 	is recursively reacquired.  A recursive call from a source wrapper could
 	otherwise reacquire the terminal destination freeze while the outer operation
 	already holds it.
+
+	Splice resolves one file endpoint at a time.  Source execution changes
+	credentials at every edge and invokes ``sync_source_access`` for each
+	wrapper after the terminal attempt.  Destination execution starts with the
+	logical freeze already held by splice.  Each layer is prepared before the
+	next backing destination is frozen, and the terminal method owns the pipe
+	lock in the usual way.  For splice, ``prepare_write`` must therefore release
+	any inode or other locks before returning; ``finish_write`` is called after
+	the terminal method has released the pipe and may reacquire them.  This keeps
+	the superblock, inode, and pipe lock orders compatible with ordinary splice
+	and with file-to-file fallback through splice.
 
 	Paired dispatch uses the layer operations-table pointer as the protocol
 	identity, even when the files have different complete ``file_operations``

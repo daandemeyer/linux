@@ -41,6 +41,14 @@ static void file_range_chain_reset(struct file_range_chain *chain)
 		fput(chain->files[--chain->nr_files]);
 }
 
+static void file_range_chain_cleanup(struct file_range_chain *chain)
+{
+	file_range_chain_reset(chain);
+}
+
+DEFINE_FREE(file_range_chain, struct file_range_chain,
+	    file_range_chain_cleanup(&_T))
+
 static void file_range_context_init(struct file_range_context *ctx,
 				    enum file_range_operation operation,
 				    struct file *file_in, loff_t pos_in,
@@ -166,6 +174,23 @@ file_range_resolve_chain(struct file_range_chain *chain,
 	return ret;
 }
 
+/* -EOPNOTSUPP leaves the current splice method authoritative. */
+static int
+file_range_resolve_splice_chain(struct file_range_chain *chain,
+				enum file_range_role role)
+{
+	int ret;
+
+	for (;;) {
+		ret = file_range_resolve_next(chain, FILE_RANGE_OPERATION_SPLICE,
+					      role, FILE_RANGE_RESOLVE_MAY_OPEN);
+		if (ret == -EOPNOTSUPP)
+			return 0;
+		if (ret <= 0)
+			return ret;
+	}
+}
+
 static struct file *
 file_range_chain_terminal(const struct file_range_chain *chain)
 {
@@ -198,6 +223,8 @@ static bool file_range_has_terminal_method(const struct file_range_context *ctx)
 						   file_out);
 		return file_inode(file_in)->i_sb == file_inode(file_out)->i_sb &&
 		       remap_file->f_op->remap_file_range;
+	case FILE_RANGE_OPERATION_SPLICE:
+		break;
 	}
 
 	return false;
@@ -222,6 +249,8 @@ static bool file_range_paired_layers(enum file_range_operation operation,
 	case FILE_RANGE_OPERATION_DEDUPE:
 		/* Advertised remap operations override the legacy callback. */
 		return true;
+	case FILE_RANGE_OPERATION_SPLICE:
+		return false;
 	}
 
 	return false;
@@ -744,18 +773,156 @@ static s64 file_range_execute(struct file_range_context *ctx,
 	return ret;
 }
 
-static void copy_file_range_sync_source_access(const struct file_range_context *ctx)
+static void
+file_range_sync_source_access(const struct file_range_chain *chain)
 {
-	unsigned int i = ctx->source.nr_files - 1;
+	unsigned int i = chain->nr_files - 1;
 
 	while (i--) {
-		struct file *file = ctx->source.files[i];
+		struct file *file = chain->files[i];
 		const struct file_range_layer_operations *ops;
 
 		ops = file->f_op->file_range_layer_ops;
 		if (ops->sync_source_access)
 			ops->sync_source_access(file);
 	}
+}
+
+static void
+copy_file_range_sync_source_access(const struct file_range_context *ctx)
+{
+	file_range_sync_source_access(&ctx->source);
+}
+
+static int warn_unsupported_splice(struct file *file, const char *op)
+{
+	pr_debug_ratelimited("splice %s unsupported for %pD4 pid=%d comm=%.20s\n",
+			     op, file, current->pid, current->comm);
+	return -EINVAL;
+}
+
+static ssize_t
+file_range_splice_read_terminal(struct file *file, loff_t *ppos,
+				struct pipe_inode_info *pipe, size_t len,
+				unsigned int flags)
+{
+	if (!file->f_op->splice_read)
+		return warn_unsupported_splice(file, "read");
+	/*
+	 * O_DIRECT and DAX don't deal with the pagecache, so allocate a buffer,
+	 * copy into it and splice that into the pipe.
+	 */
+	if ((file->f_flags & O_DIRECT) || IS_DAX(file->f_mapping->host))
+		return copy_splice_read(file, ppos, pipe, len, flags);
+	return file->f_op->splice_read(file, ppos, pipe, len, flags);
+}
+
+static ssize_t
+file_range_splice_read_execute(const struct file_range_chain *chain,
+			       unsigned int layer, loff_t *ppos,
+			       struct pipe_inode_info *pipe, size_t len,
+			       unsigned int flags)
+{
+	ssize_t ret;
+
+	if (layer + 1 == chain->nr_files)
+		return file_range_splice_read_terminal(chain->files[layer], ppos,
+						       pipe, len, flags);
+
+	scoped_with_creds(chain->files[layer + 1]->f_cred)
+		ret = file_range_splice_read_execute(chain, layer + 1, ppos,
+						     pipe, len, flags);
+	return ret;
+}
+
+ssize_t file_range_splice_read(struct file *in, loff_t *ppos,
+			       struct pipe_inode_info *pipe, size_t len,
+			       unsigned int flags)
+{
+	struct file_range_chain chain __free(file_range_chain) = {
+		.files[0] = in,
+		.nr_files = 1,
+	};
+	ssize_t ret;
+	unsigned int i;
+
+	ret = file_range_resolve_splice_chain(&chain, FILE_RANGE_SOURCE);
+	if (ret)
+		return ret;
+
+	for (i = 1; i < chain.nr_files; i++) {
+		scoped_with_creds(chain.files[i]->f_cred)
+			ret = rw_verify_area(READ, chain.files[i], ppos, len);
+		if (ret)
+			goto out_sync;
+	}
+
+	ret = file_range_splice_read_execute(&chain, 0, ppos, pipe, len,
+					     flags);
+out_sync:
+	file_range_sync_source_access(&chain);
+	return ret;
+}
+
+static ssize_t
+splice_write_terminal(struct pipe_inode_info *pipe, struct file *file,
+		      loff_t *ppos, size_t len, unsigned int flags)
+{
+	if (!file->f_op->splice_write)
+		return warn_unsupported_splice(file, "write");
+	return file->f_op->splice_write(pipe, file, ppos, len, flags);
+}
+
+static ssize_t
+splice_write_execute(const struct file_range_chain *chain, unsigned int layer,
+		     struct pipe_inode_info *pipe, loff_t *ppos, size_t len,
+		     unsigned int flags, loff_t pos_out)
+{
+	struct file *file = chain->files[layer];
+	const struct file_range_layer_operations *ops;
+	ssize_t ret;
+
+	if (layer + 1 == chain->nr_files)
+		return splice_write_terminal(pipe, file, ppos, len, flags);
+
+	ops = file->f_op->file_range_layer_ops;
+	ret = ops->prepare_write(file, chain->files[layer + 1],
+				 FILE_RANGE_OPERATION_SPLICE);
+	if (ret)
+		return ret;
+
+	scoped_with_creds(chain->files[layer + 1]->f_cred) {
+		scoped_guard(super_write,
+			     file_inode(chain->files[layer + 1])->i_sb) {
+			ret = splice_write_execute(chain, layer + 1, pipe, ppos,
+						   len, flags, pos_out);
+		}
+	}
+	ops->finish_write(file, chain->files[layer + 1],
+			  FILE_RANGE_OPERATION_SPLICE, pos_out, ret);
+	return ret;
+}
+
+ssize_t file_range_splice_write(struct pipe_inode_info *pipe,
+				struct file *out, loff_t *ppos, size_t len,
+				unsigned int flags)
+{
+	struct file_range_chain chain __free(file_range_chain) = {
+		.files[0] = out,
+		.nr_files = 1,
+	};
+	loff_t pos_out = *ppos;
+	ssize_t ret;
+
+	ret = file_range_resolve_splice_chain(&chain, FILE_RANGE_DESTINATION);
+	if (ret)
+		return ret;
+	ret = file_range_revalidate_chain(&chain, FILE_RANGE_OPERATION_SPLICE,
+					  FILE_RANGE_DESTINATION);
+	if (ret)
+		return ret;
+	return splice_write_execute(&chain, 0, pipe, ppos, len, flags,
+				    pos_out);
 }
 
 static void file_range_notify_backing(const struct file_range_context *ctx)

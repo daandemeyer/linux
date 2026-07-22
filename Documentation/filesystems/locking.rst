@@ -542,13 +542,16 @@ used. To block changes to file contents via a memory mapping during the
 operation, the filesystem must take mapping->invalidate_lock to coordinate
 with ->page_mkwrite.
 
-The VFS calls ``file_range_layer_ops->resolve`` without a write freeze or
-inode lock held.  ``FILE_RANGE_RESOLVE_CACHED`` may not do I/O, open a
+The VFS calls range-operation ``file_range_layer_ops->resolve`` without a write
+freeze or inode lock held.  A destination splice already holds the logical
+file's write freeze when it resolves backing layers.  No resolver is called
+with an inode lock held.  ``FILE_RANGE_RESOLVE_CACHED`` may not do I/O, open a
 file, or mutate state; ``FILE_RANGE_RESOLVE_MAY_OPEN`` may establish
 transient open or cache state, but may not copy up data or mutate persistent
 state.  Both modes return a referenced file which the VFS will put.
 
-All logical and backing permission checks complete before destination write
+For copy, clone, and dedupe, all logical and backing permission checks complete
+before destination write
 freezes and inode locks are taken, because permission hooks may mutate an
 endpoint.  Dedupe additionally takes mount write access for each destination
 after its permission check, separately from freeze protection, so the same
@@ -561,7 +564,11 @@ prepare or the terminal operation fails.  It receives the original output
 position and the result from the remainder of the destination chain.  Source
 layers are never prepared or write-frozen by this interface.  The optional
 ``sync_source_access`` callback is called without a source inode lock or write
-freeze after the destination transaction has unwound.
+freeze after the destination transaction has unwound.  Splice resolves one
+endpoint at a time.  Its logical permission check precedes resolution; source
+backing permission checks run without a write freeze.  A destination splice
+enters with its logical freeze held, prepares that layer, and takes each
+backing write freeze before preparing the next layer.
 
 dquot_operations
 ================
