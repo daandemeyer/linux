@@ -575,6 +575,40 @@ static int clone_once(const char *source, const char *destination, size_t len)
 	return ret;
 }
 
+static int dedupe_once(const char *source, const char *destination, size_t len)
+{
+	struct file_dedupe_range *range;
+	int source_fd, destination_fd;
+	int ret;
+
+	source_fd = open(source, O_RDONLY | O_CLOEXEC);
+	if (source_fd < 0)
+		return -errno;
+	destination_fd = open(destination, O_RDONLY | O_CLOEXEC);
+	if (destination_fd < 0) {
+		ret = -errno;
+		close(source_fd);
+		return ret;
+	}
+	range = calloc(1, sizeof(*range) + sizeof(range->info[0]));
+	if (!range) {
+		close(destination_fd);
+		close(source_fd);
+		return -ENOMEM;
+	}
+	range->src_length = len;
+	range->dest_count = 1;
+	range->info[0].dest_fd = destination_fd;
+	if (ioctl(source_fd, FIDEDUPERANGE, range))
+		ret = -errno;
+	else
+		ret = range->info[0].status;
+	free(range);
+	close(destination_fd);
+	close(source_fd);
+	return ret;
+}
+
 static int compare_range(const char *source, const char *destination,
 			 loff_t pos_in, loff_t pos_out, size_t len)
 {
@@ -921,6 +955,38 @@ TEST_F(fuse_passthrough, clone_method_selection)
 	ASSERT_EQ(0, st.st_size);
 	ASSERT_EQ(0, stat(plain_output, &st));
 	ASSERT_EQ(0, st.st_size);
+}
+
+TEST_F(fuse_passthrough, dedupe_method_selection)
+{
+	char src[PATH_MAX], dst[PATH_MAX], server[PATH_MAX];
+	char direct[PATH_MAX], mixed[PATH_MAX];
+	const char *plain_source = self->paths[NODE_COUNT];
+	const char *plain_output = self->paths[NODE_COUNT + 1];
+	unsigned char before[4096], after[4096];
+
+	ASSERT_EQ(0, logical_path(self->mountpoint, "src", src, sizeof(src)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "dst", dst, sizeof(dst)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "server", server,
+				  sizeof(server)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "direct", direct,
+				  sizeof(direct)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "mixed", mixed,
+				  sizeof(mixed)));
+
+	ASSERT_EQ(0, write_pattern(self->paths[NODE_DST], 0x6a, TEST_SIZE));
+	ASSERT_EQ(0, read_range(self->paths[NODE_DST], before, sizeof(before), 0));
+	ASSERT_EQ(-EINVAL, dedupe_once(src, dst, TEST_SIZE));
+	ASSERT_EQ(-EINVAL, dedupe_once(src, plain_output, TEST_SIZE));
+	ASSERT_EQ(-EOPNOTSUPP, dedupe_once(plain_source, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, dedupe_once(server, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, dedupe_once(direct, dst, TEST_SIZE));
+	ASSERT_EQ(-EINVAL, dedupe_once(mixed, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, dedupe_once(src, server, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, dedupe_once(src, direct, TEST_SIZE));
+	ASSERT_EQ(-EINVAL, dedupe_once(src, mixed, TEST_SIZE));
+	ASSERT_EQ(0, read_range(self->paths[NODE_DST], after, sizeof(after), 0));
+	ASSERT_EQ(0, memcmp(before, after, sizeof(before)));
 }
 
 TEST_F(fuse_passthrough, source_atime)
