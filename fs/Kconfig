@@ -27,10 +27,10 @@ config FILE_RANGE_KUNIT_TEST
 	depends on KUNIT=y && FS_STACK
 	default KUNIT_ALL_TESTS
 	help
-	  Build tests for copy and clone routing through paired file layers.  The
-	  tests cover method selection, resolver reference ownership, revalidation
-	  and prepare failure unwind, terminal remap or splice result handling, and
-	  freeze ordering.
+	  Build tests for copy, clone, and dedupe routing through paired file
+	  layers.  The tests cover method selection, resolver reference ownership,
+	  revalidation and prepare failure unwind, terminal remap or splice result
+	  handling, and freeze ordering.
 
 config BUFFER_HEAD
 	bool

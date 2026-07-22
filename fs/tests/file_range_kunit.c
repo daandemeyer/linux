@@ -312,6 +312,16 @@ file_range_test_splice_read(struct file *file, loff_t *ppos,
 
 static const struct file_range_layer_operations file_range_test_layer_ops = {
 	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
+				BIT(FILE_RANGE_OPERATION_CLONE) |
+				BIT(FILE_RANGE_OPERATION_DEDUPE),
+	.resolve = file_range_test_resolve,
+	.prepare_write = file_range_test_prepare,
+	.finish_write = file_range_test_finish,
+};
+
+static const struct file_range_layer_operations
+file_range_test_clone_layer_ops = {
+	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
 				BIT(FILE_RANGE_OPERATION_CLONE),
 	.resolve = file_range_test_resolve,
 	.prepare_write = file_range_test_prepare,
@@ -322,14 +332,16 @@ static const struct file_range_layer_operations
 file_range_test_fail_layer_ops[] = {
 	{
 		.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
-					BIT(FILE_RANGE_OPERATION_CLONE),
+					BIT(FILE_RANGE_OPERATION_CLONE) |
+					BIT(FILE_RANGE_OPERATION_DEDUPE),
 		.resolve = file_range_test_fail_resolve,
 		.prepare_write = file_range_test_prepare,
 		.finish_write = file_range_test_finish,
 	},
 	{
 		.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
-					BIT(FILE_RANGE_OPERATION_CLONE),
+					BIT(FILE_RANGE_OPERATION_CLONE) |
+					BIT(FILE_RANGE_OPERATION_DEDUPE),
 		.resolve = file_range_test_fail_resolve,
 		.prepare_write = file_range_test_prepare,
 		.finish_write = file_range_test_finish,
@@ -344,6 +356,11 @@ static const struct file_operations file_range_test_wrapper_fops = {
 static const struct file_operations file_range_test_remap_wrapper_fops = {
 	.remap_file_range = file_range_test_remap,
 	.file_range_layer_ops = &file_range_test_layer_ops,
+};
+
+static const struct file_operations file_range_test_clone_remap_wrapper_fops = {
+	.remap_file_range = file_range_test_remap,
+	.file_range_layer_ops = &file_range_test_clone_layer_ops,
 };
 
 static const struct file_operations file_range_test_method_wrapper_fops[] = {
@@ -385,7 +402,8 @@ static const struct file_operations file_range_test_remap_fops = {
 	.splice_read = file_range_test_splice_read,
 	.remap_file_range = file_range_test_remap,
 	.fop_flags = FOP_COPY_FILE_RANGE_BACKING |
-		     FOP_CLONE_FILE_RANGE_BACKING,
+		     FOP_CLONE_FILE_RANGE_BACKING |
+		     FOP_DEDUPE_FILE_RANGE_BACKING,
 };
 
 static const struct file_operations file_range_test_copy_only_remap_fops = {
@@ -393,10 +411,16 @@ static const struct file_operations file_range_test_copy_only_remap_fops = {
 	.fop_flags = FOP_COPY_FILE_RANGE_BACKING,
 };
 
+static const struct file_operations file_range_test_clone_only_remap_fops = {
+	.remap_file_range = file_range_test_remap,
+	.fop_flags = FOP_CLONE_FILE_RANGE_BACKING,
+};
+
 static const struct file_operations file_range_test_freeze_fops = {
 	.remap_file_range = file_range_test_freeze_remap,
 	.fop_flags = FOP_COPY_FILE_RANGE_BACKING |
-		     FOP_CLONE_FILE_RANGE_BACKING,
+		     FOP_CLONE_FILE_RANGE_BACKING |
+		     FOP_DEDUPE_FILE_RANGE_BACKING,
 };
 
 static const struct file_operations file_range_test_flagged_copy_fops = {
@@ -483,10 +507,10 @@ file_range_test_mount(struct kunit *test, struct file_system_type *fs_type,
 }
 
 static struct file *
-alloc_test_file(struct kunit *test, struct vfsmount *mnt,
-		const struct file_operations *fops,
-		struct file_range_test_file *test_file,
-		struct file *user_file)
+alloc_test_file_flags(struct kunit *test, struct vfsmount *mnt,
+		      const struct file_operations *fops,
+		      struct file_range_test_file *test_file,
+		      struct file *user_file, int flags)
 {
 	struct inode *inode __free(file_range_test_iput) =
 		new_inode_pseudo(mnt->mnt_sb);
@@ -501,14 +525,14 @@ alloc_test_file(struct kunit *test, struct vfsmount *mnt,
 	inode->i_fop = fops;
 
 	struct file *path_file __free(fput) =
-		alloc_file_pseudo(inode, mnt, "copy", O_RDWR, fops);
+		alloc_file_pseudo(inode, mnt, "copy", flags, fops);
 
 	if (IS_ERR(path_file))
 		return path_file;
 	retain_and_null_ptr(inode);
 
 	if (user_file) {
-		file = backing_file_open(user_file, O_RDWR,
+		file = backing_file_open(user_file, flags,
 					 &path_file->f_path, current_cred());
 		if (IS_ERR(file))
 			return file;
@@ -516,6 +540,16 @@ alloc_test_file(struct kunit *test, struct vfsmount *mnt,
 		file = no_free_ptr(path_file);
 	}
 	return file_range_test_manage_file(test, file, test_file);
+}
+
+static struct file *
+alloc_test_file(struct kunit *test, struct vfsmount *mnt,
+		const struct file_operations *fops,
+		struct file_range_test_file *test_file,
+		struct file *user_file)
+{
+	return alloc_test_file_flags(test, mnt, fops, test_file, user_file,
+				     O_RDWR);
 }
 
 static struct file *
@@ -1226,11 +1260,12 @@ static void file_range_test_terminal_remap_results(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, file_count(backing_source), backing_refs);
 	KUNIT_EXPECT_EQ(test, file_count(destination), destination_refs);
 
+	/* A negative remap result retains the ordinary splice fallback too. */
 	ctx->remap_ret = -EUCLEAN;
 	ret = vfs_copy_file_range(source, 0, destination, 0, 512, 0);
-	KUNIT_EXPECT_EQ(test, ret, (ssize_t)-EUCLEAN);
+	KUNIT_EXPECT_EQ(test, ret, (ssize_t)-ENODATA);
 	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 3U);
-	KUNIT_EXPECT_EQ(test, ctx->splice_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->splice_calls, 2U);
 	KUNIT_EXPECT_EQ(test, file_count(backing_source), backing_refs);
 	KUNIT_EXPECT_EQ(test, file_count(destination), destination_refs);
 }
@@ -1267,7 +1302,8 @@ file_range_test_splice_without_terminal_freeze(struct kunit *test)
 }
 
 static void
-file_range_test_recursive_freeze_operation(struct kunit *test, bool clone)
+file_range_test_freeze_operation(struct kunit *test,
+				 enum file_range_operation operation)
 {
 	struct file_range_test_backing_route *route;
 	struct file_range_test_freeze *freeze;
@@ -1295,9 +1331,13 @@ file_range_test_recursive_freeze_operation(struct kunit *test, bool clone)
 	 * Count earlier recursion at terminal dispatch.  Trylock then models a
 	 * later acquisition without deadlocking behind the pending freezer.
 	 */
-	if (clone)
+	if (operation == FILE_RANGE_OPERATION_CLONE)
 		ret = vfs_clone_file_range(route->source->wrapper, 0,
 					   route->destination, 0, 512, 0);
+	else if (operation == FILE_RANGE_OPERATION_DEDUPE)
+		ret = vfs_dedupe_file_range_one(route->source->wrapper, 0,
+						route->destination, 0, 512,
+						REMAP_FILE_CAN_SHORTEN);
 	else
 		ret = vfs_copy_file_range(route->source->wrapper, 0,
 					  route->destination, 0, 512, 0);
@@ -1325,12 +1365,17 @@ file_range_test_recursive_freeze_operation(struct kunit *test, bool clone)
 
 static void file_range_test_recursive_freeze(struct kunit *test)
 {
-	file_range_test_recursive_freeze_operation(test, false);
+	file_range_test_freeze_operation(test, FILE_RANGE_OPERATION_COPY);
 }
 
 static void file_range_test_clone_recursive_freeze(struct kunit *test)
 {
-	file_range_test_recursive_freeze_operation(test, true);
+	file_range_test_freeze_operation(test, FILE_RANGE_OPERATION_CLONE);
+}
+
+static void file_range_test_dedupe_recursive_freeze(struct kunit *test)
+{
+	file_range_test_freeze_operation(test, FILE_RANGE_OPERATION_DEDUPE);
 }
 
 static void file_range_test_clone_backing_routes(struct kunit *test)
@@ -1457,6 +1502,196 @@ static void file_range_test_clone_requires_terminal_opt_in(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 0U);
 }
 
+static void file_range_test_paired_dedupe(struct kunit *test)
+{
+	struct file_range_test_layered_file *source, *destination;
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	source = alloc_layered_file(test, ctx, mounts[1], mounts[2],
+				    &file_range_test_remap_wrapper_fops,
+				    &file_range_test_remap_fops);
+	destination = alloc_layered_file(test, ctx, mounts[1], mounts[2],
+					 &file_range_test_remap_wrapper_fops,
+					 &file_range_test_remap_fops);
+
+	ctx->remap_ret = 512;
+	ret = vfs_dedupe_file_range_one(source->wrapper, 0,
+					destination->wrapper, 0, 512,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)512);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->finish_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->resolve_operation,
+			FILE_RANGE_OPERATION_DEDUPE);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_operation,
+			FILE_RANGE_OPERATION_DEDUPE);
+	KUNIT_EXPECT_EQ(test, ctx->finish_operation,
+			FILE_RANGE_OPERATION_DEDUPE);
+	KUNIT_EXPECT_EQ(test, ctx->remap_flags,
+			(unsigned int)(REMAP_FILE_DEDUP |
+				       REMAP_FILE_CAN_SHORTEN));
+}
+
+static void file_range_test_unadvertised_dedupe_uses_remap(struct kunit *test)
+{
+	struct file_range_test_layered_file *source, *destination;
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	source = alloc_layered_file(test, ctx, mounts[1], mounts[2],
+				    &file_range_test_clone_remap_wrapper_fops,
+				    &file_range_test_remap_fops);
+	destination = alloc_layered_file(test, ctx, mounts[1], mounts[2],
+					 &file_range_test_clone_remap_wrapper_fops,
+					 &file_range_test_remap_fops);
+
+	ctx->remap_ret = 512;
+	ret = vfs_clone_file_range(source->wrapper, 0, destination->wrapper, 0,
+				   512, 0);
+	KUNIT_ASSERT_EQ(test, ret, (loff_t)512);
+	KUNIT_ASSERT_EQ(test, ctx->prepare_calls, 1U);
+	KUNIT_ASSERT_EQ(test, ctx->resolve_operation,
+			FILE_RANGE_OPERATION_CLONE);
+
+	ret = vfs_dedupe_file_range_one(source->wrapper, 0,
+					destination->wrapper, 0, 512, 0);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)512);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->finish_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->resolve_operation,
+			FILE_RANGE_OPERATION_CLONE);
+	KUNIT_EXPECT_EQ(test, ctx->remap_flags,
+			(unsigned int)REMAP_FILE_DEDUP);
+}
+
+static void file_range_test_dedupe_requires_terminal_opt_in(struct kunit *test)
+{
+	struct file_range_test_backing_route *route;
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	route = alloc_backing_route(test, ctx, mounts[1], mounts[2],
+				    &file_range_test_clone_only_remap_fops);
+
+	/* Clone's backing-file opt-in must not implicitly authorize dedupe. */
+	ret = vfs_dedupe_file_range_one(route->source->wrapper, 0,
+					route->destination, 0, 512,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)-EXDEV);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 0U);
+}
+
+static void file_range_test_zero_length_dedupe_resolves(struct kunit *test)
+{
+	struct file_range_test_backing_route *route;
+	struct file_range_test_file *wrapper;
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	route = alloc_backing_route(test, ctx, mounts[1], mounts[2],
+				    &file_range_test_remap_fops);
+	wrapper = &route->source->wrapper_private;
+	wrapper->resolve_error = -EAGAIN;
+	wrapper->resolve_error_role = FILE_RANGE_SOURCE;
+	wrapper->resolve_error_mode = FILE_RANGE_RESOLVE_CACHED;
+
+	/* Zero-length dedupe still resolves and authorizes the backing route. */
+	ret = vfs_dedupe_file_range_one(route->source->wrapper, 0,
+					route->destination, 0, 0,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)0);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 0U);
+	KUNIT_EXPECT_EQ(test,
+			ctx->resolve_calls[0][FILE_RANGE_SOURCE]
+					  [FILE_RANGE_RESOLVE_MAY_OPEN], 1U);
+}
+
+static void file_range_test_paired_zero_length_dedupe(struct kunit *test)
+{
+	struct file_range_test_layered_file *source, *destination;
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	source = alloc_layered_file(test, ctx, mounts[0], mounts[1],
+				    &file_range_test_wrapper_fops,
+				    &file_range_test_remap_fops);
+	destination = alloc_layered_file(test, ctx, mounts[0], mounts[2],
+					 &file_range_test_wrapper_fops,
+					 &file_range_test_remap_fops);
+
+	/* Paired wrappers must not hide incompatible terminal files. */
+	ret = vfs_dedupe_file_range_one(source->wrapper, 0,
+					destination->wrapper, 0, 0,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)-EXDEV);
+	KUNIT_EXPECT_EQ(test, ctx->resolve_calls[0][FILE_RANGE_SOURCE]
+					       [FILE_RANGE_RESOLVE_MAY_OPEN], 1U);
+	KUNIT_EXPECT_EQ(test, ctx->resolve_calls[0][FILE_RANGE_DESTINATION]
+					       [FILE_RANGE_RESOLVE_MAY_OPEN], 1U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 0U);
+}
+
+static void file_range_test_dedupe_uses_destination_method(struct kunit *test)
+{
+	struct file_range_test_file source_private = {}, destination_private = {};
+	struct file_range_test_ctx *ctx;
+	struct vfsmount *mounts[3];
+	struct file *source, *destination;
+	loff_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->remap_ret = 512;
+	source_private.ctx = ctx;
+	destination_private.ctx = ctx;
+	file_range_test_init_mounts(test, mounts);
+	source = alloc_test_file(test, mounts[2],
+				 &file_range_test_unflagged_fops,
+				 &source_private, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, source);
+	destination = alloc_test_file_flags(test, mounts[2],
+					    &file_range_test_remap_fops,
+					    &destination_private, NULL,
+					    O_RDONLY);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, destination);
+
+	ret = vfs_dedupe_file_range_one(source, 0, destination, 0, 512,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)512);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 1U);
+
+	ret = vfs_dedupe_file_range_one(destination, 0, source, 0, 512,
+					REMAP_FILE_CAN_SHORTEN);
+	KUNIT_EXPECT_EQ(test, ret, (loff_t)-EINVAL);
+	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 1U);
+}
+
 static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_paired_dispatch),
 	KUNIT_CASE(file_range_test_credential_domains),
@@ -1473,9 +1708,16 @@ static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_splice_without_terminal_freeze),
 	KUNIT_CASE(file_range_test_recursive_freeze),
 	KUNIT_CASE(file_range_test_clone_recursive_freeze),
+	KUNIT_CASE(file_range_test_dedupe_recursive_freeze),
 	KUNIT_CASE(file_range_test_clone_backing_routes),
 	KUNIT_CASE(file_range_test_paired_clone),
 	KUNIT_CASE(file_range_test_clone_requires_terminal_opt_in),
+	KUNIT_CASE(file_range_test_paired_dedupe),
+	KUNIT_CASE(file_range_test_unadvertised_dedupe_uses_remap),
+	KUNIT_CASE(file_range_test_dedupe_requires_terminal_opt_in),
+	KUNIT_CASE(file_range_test_zero_length_dedupe_resolves),
+	KUNIT_CASE(file_range_test_paired_zero_length_dedupe),
+	KUNIT_CASE(file_range_test_dedupe_uses_destination_method),
 	{},
 };
 
