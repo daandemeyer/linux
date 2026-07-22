@@ -242,6 +242,89 @@ static int dedupe_range_once(const char *source, const char *destination,
 	return ret;
 }
 
+static ssize_t splice_once(const char *source, const char *destination,
+			   loff_t pos_in, loff_t pos_out, size_t len)
+{
+	int pipefd[2] = { -1, -1 };
+	ssize_t copied = 0;
+
+	int source_fd __free(close_fd) = open(source, O_RDONLY | O_CLOEXEC);
+
+	if (source_fd < 0)
+		return -errno;
+
+	int destination_fd __free(close_fd) =
+		open(destination, O_WRONLY | O_CLOEXEC);
+
+	if (destination_fd < 0)
+		return -errno;
+	if (pipe2(pipefd, O_CLOEXEC))
+		return -errno;
+
+	int pipe_read __free(close_fd) = pipefd[0];
+	int pipe_write __free(close_fd) = pipefd[1];
+
+	while ((size_t)copied < len) {
+		ssize_t pending, written = 0;
+
+		do {
+			pending = splice(source_fd, &pos_in, pipe_write, NULL,
+					 len - copied, 0);
+		} while (pending < 0 && errno == EINTR);
+		if (pending <= 0)
+			return pending < 0 ? -errno : copied;
+
+		while (written < pending) {
+			ssize_t bytes;
+
+			do {
+				bytes = splice(pipe_read, NULL, destination_fd,
+					       &pos_out, pending - written, 0);
+			} while (bytes < 0 && errno == EINTR);
+			if (bytes <= 0)
+				return bytes < 0 ? -errno : -EIO;
+			written += bytes;
+		}
+		copied += pending;
+	}
+
+	return copied;
+}
+
+static ssize_t splice_once_unprivileged(const char *source,
+					const char *destination, size_t len)
+{
+	struct copy_result *shared __free(unmap_copy_result) =
+		mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+		     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	int status;
+
+	if (shared == MAP_FAILED)
+		return -errno;
+	memset(shared, 0, sizeof(*shared));
+	shared->ret = -1;
+
+	pid_t pid = fork();
+
+	if (pid < 0)
+		return -errno;
+	if (!pid) {
+		if (setgroups(0, NULL) || setgid(65534) || setuid(65534))
+			shared->ret = -errno;
+		else
+			shared->ret = splice_once(source, destination, 0, 0, len);
+		shared->done = 1;
+		_exit(0);
+	}
+	while (waitpid(pid, &status, 0) < 0) {
+		if (errno != EINTR)
+			return -errno;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) || !shared->done)
+		return -EIO;
+	return shared->ret;
+}
+
 static void cleanup_fixture(struct _test_data_file_range *self)
 {
 	char merged[PATH_MAX];
@@ -654,6 +737,64 @@ TEST_F(file_range, dedupe_reaches_terminal_filesystem)
 	ret = dedupe_range_once(source, destination, 0, 0, FILE_SIZE);
 	EXPECT_EQ(-EINVAL, ret);
 	EXPECT_EQ(0, compare_files(source, destination));
+}
+
+TEST_F(file_range, splice_traverses_layers)
+{
+	char logical_source[PATH_MAX], upper_source[PATH_MAX];
+	char plain_source[PATH_MAX], plain_destination[PATH_MAX];
+	char logical_destination[PATH_MAX], paired_destination[PATH_MAX];
+	char merged[PATH_MAX];
+	struct stat statbuf;
+	int error, ret;
+
+	ASSERT_EQ(0, make_path(logical_source, sizeof(logical_source), self->root,
+			       "merged/data"));
+	ASSERT_EQ(0, make_path(upper_source, sizeof(upper_source), self->root,
+			       "upper/data"));
+	ASSERT_EQ(0, make_path(plain_source, sizeof(plain_source), self->root,
+			       "plain"));
+	ASSERT_EQ(0, make_path(plain_destination, sizeof(plain_destination),
+			       self->root, "splice-source-output"));
+	ASSERT_EQ(0, make_path(logical_destination,
+			       sizeof(logical_destination), self->root,
+			       "merged/splice-destination"));
+	ASSERT_EQ(0, make_path(paired_destination,
+			       sizeof(paired_destination), self->root,
+			       "merged/splice-paired"));
+	ASSERT_EQ(0, make_path(merged, sizeof(merged), self->root, "merged"));
+	ASSERT_EQ(0, create_empty_file(plain_destination));
+	ASSERT_EQ(0, create_empty_file(logical_destination));
+	ASSERT_EQ(0, create_empty_file(paired_destination));
+
+	ret = access(upper_source, F_OK);
+	error = errno;
+	ASSERT_EQ(-1, ret);
+	ASSERT_EQ(ENOENT, error);
+	ASSERT_EQ((ssize_t)FILE_SIZE,
+		  splice_once(logical_source, plain_destination, 0, 0,
+			      FILE_SIZE));
+	EXPECT_EQ(0, compare_files(logical_source, plain_destination));
+	ret = access(upper_source, F_OK);
+	error = errno;
+	EXPECT_EQ(-1, ret);
+	EXPECT_EQ(ENOENT, error);
+
+	ASSERT_EQ(0, chmod(self->root, 0711));
+	ASSERT_EQ(0, chmod(merged, 0711));
+	ASSERT_EQ(0, chmod(plain_source, 0644));
+	ASSERT_EQ(0, chmod(logical_destination, 06777));
+	ASSERT_EQ((ssize_t)FILE_SIZE,
+		  splice_once_unprivileged(plain_source, logical_destination,
+					   FILE_SIZE));
+	EXPECT_EQ(0, stat(logical_destination, &statbuf));
+	EXPECT_EQ((mode_t)0, statbuf.st_mode & 06000);
+	EXPECT_EQ(0, compare_files(plain_source, logical_destination));
+
+	ASSERT_EQ((ssize_t)FILE_SIZE,
+		  splice_once(logical_source, paired_destination, 0, 0,
+			      FILE_SIZE));
+	EXPECT_EQ(0, compare_files(logical_source, paired_destination));
 }
 
 static bool fanotify_unavailable(int error)
