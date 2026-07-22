@@ -10,7 +10,6 @@
 
 #include <linux/fs.h>
 #include <linux/backing-file.h>
-#include <linux/splice.h>
 #include <linux/mm.h>
 #include <linux/security.h>
 
@@ -275,56 +274,6 @@ ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
 		return do_backing_file_write_iter(file, iter, iocb, flags, ctx->end_write);
 }
 EXPORT_SYMBOL_GPL(backing_file_write_iter);
-
-ssize_t backing_file_splice_read(struct file *in, struct kiocb *iocb,
-				 struct pipe_inode_info *pipe, size_t len,
-				 unsigned int flags,
-				 struct backing_file_ctx *ctx)
-{
-	ssize_t ret;
-
-	if (WARN_ON_ONCE(!(in->f_mode & FMODE_BACKING)))
-		return -EIO;
-
-	scoped_with_creds(ctx->cred)
-		ret = vfs_splice_read(in, &iocb->ki_pos, pipe, len, flags);
-
-	if (ctx->accessed)
-		ctx->accessed(iocb->ki_filp);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(backing_file_splice_read);
-
-ssize_t backing_file_splice_write(struct pipe_inode_info *pipe,
-				  struct file *out, struct kiocb *iocb,
-				  size_t len, unsigned int flags,
-				  struct backing_file_ctx *ctx)
-{
-	ssize_t ret;
-
-	if (WARN_ON_ONCE(!(out->f_mode & FMODE_BACKING)))
-		return -EIO;
-
-	if (!out->f_op->splice_write)
-		return -EINVAL;
-
-	ret = file_remove_privs(iocb->ki_filp);
-	if (ret)
-		return ret;
-
-	scoped_with_creds(ctx->cred) {
-		file_start_write(out);
-		ret = out->f_op->splice_write(pipe, out, &iocb->ki_pos, len, flags);
-		file_end_write(out);
-	}
-
-	if (ctx->end_write)
-		ctx->end_write(iocb, ret);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(backing_file_splice_write);
 
 int backing_file_mmap(struct file *file, struct vm_area_struct *vma,
 		      struct backing_file_ctx *ctx)

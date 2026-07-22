@@ -9,7 +9,6 @@
 
 #include <linux/file.h>
 #include <linux/backing-file.h>
-#include <linux/splice.h>
 
 static void fuse_file_accessed(struct file *file)
 {
@@ -35,7 +34,8 @@ fuse_passthrough_file_range_resolve(struct file *file,
 	struct file *backing_file = fuse_file_passthrough(ff);
 
 	if (!backing_file || (ff->open_flags & FOPEN_DIRECT_IO))
-		return ERR_PTR(-EXDEV);
+		return ERR_PTR(operation == FILE_RANGE_OPERATION_SPLICE ?
+			       -EOPNOTSUPP : -EXDEV);
 	if (fuse_is_bad(file_inode(file)))
 		return ERR_PTR(-EIO);
 
@@ -97,7 +97,8 @@ fuse_passthrough_file_range_finish_write(struct file *file, struct file *next,
 const struct file_range_layer_operations fuse_passthrough_file_range_layer_ops = {
 	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
 				BIT(FILE_RANGE_OPERATION_CLONE) |
-				BIT(FILE_RANGE_OPERATION_DEDUPE),
+				BIT(FILE_RANGE_OPERATION_DEDUPE) |
+				BIT(FILE_RANGE_OPERATION_SPLICE),
 	.resolve	= fuse_passthrough_file_range_resolve,
 	.prepare_write	= fuse_passthrough_file_range_prepare_write,
 	.finish_write	= fuse_passthrough_file_range_finish_write,
@@ -152,57 +153,6 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 	inode_lock(inode);
 	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
 				      &ctx);
-	inode_unlock(inode);
-
-	return ret;
-}
-
-ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
-				     struct pipe_inode_info *pipe,
-				     size_t len, unsigned int flags)
-{
-	struct fuse_file *ff = in->private_data;
-	struct file *backing_file = fuse_file_passthrough(ff);
-	struct backing_file_ctx ctx = {
-		.cred = ff->cred,
-		.accessed = fuse_file_accessed,
-	};
-	struct kiocb iocb;
-	ssize_t ret;
-
-	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
-		 backing_file, *ppos, len, flags);
-
-	init_sync_kiocb(&iocb, in);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_read(backing_file, &iocb, pipe, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
-
-	return ret;
-}
-
-ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
-				      struct file *out, loff_t *ppos,
-				      size_t len, unsigned int flags)
-{
-	struct fuse_file *ff = out->private_data;
-	struct file *backing_file = fuse_file_passthrough(ff);
-	struct inode *inode = file_inode(out);
-	ssize_t ret;
-	struct backing_file_ctx ctx = {
-		.cred = ff->cred,
-		.end_write = fuse_passthrough_end_write,
-	};
-	struct kiocb iocb;
-
-	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
-		 backing_file, *ppos, len, flags);
-
-	inode_lock(inode);
-	init_sync_kiocb(&iocb, out);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_write(pipe, backing_file, &iocb, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
 	inode_unlock(inode);
 
 	return ret;

@@ -36,6 +36,11 @@ destination is passthrough.  The VFS revalidates the backing destination and
 brackets the terminal write with the FUSE inode lock, privilege removal, size
 update, and write freeze.
 
+Splice uses the same layer operations one endpoint at a time.  Passthrough
+opens resolve to the backing file for file-to-pipe reads and pipe-to-file
+writes.  Non-passthrough and direct-I/O opens remain opaque and use the normal
+FUSE buffered splice methods.
+
 Newly reachable terminal pairs must share a superblock and a
 ``file_operations`` table which advertises the corresponding
 ``FOP_COPY_FILE_RANGE_BACKING``, ``FOP_CLONE_FILE_RANGE_BACKING``, or
