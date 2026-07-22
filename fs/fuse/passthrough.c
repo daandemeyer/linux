@@ -61,9 +61,11 @@ fuse_passthrough_file_range_prepare_write(struct file *file, struct file *next,
 		goto out_unlock;
 	}
 
-	ret = file_remove_privs(file);
-	if (ret)
-		goto out_unlock;
+	if (operation != FILE_RANGE_OPERATION_DEDUPE) {
+		ret = file_remove_privs(file);
+		if (ret)
+			goto out_unlock;
+	}
 	inode_unlock(inode);
 	return 0;
 
@@ -81,14 +83,21 @@ fuse_passthrough_file_range_finish_write(struct file *file, struct file *next,
 	ssize_t written = ret > 0 ? 1 : ret;
 
 	inode_lock(file_inode(file));
-	fuse_write_update_attr(file_inode(file), pos, written);
+	if (operation == FILE_RANGE_OPERATION_DEDUPE) {
+		if (ret > 0)
+			fuse_invalidate_attr_mask(file_inode(file),
+						  FUSE_STATX_MODIFY);
+	} else {
+		fuse_write_update_attr(file_inode(file), pos, written);
+	}
 	inode_unlock(file_inode(file));
 }
 
 /* Exact FUSE copy pairs keep fuse_copy_file_range(); remaps are resolved. */
 const struct file_range_layer_operations fuse_passthrough_file_range_layer_ops = {
 	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
-				BIT(FILE_RANGE_OPERATION_CLONE),
+				BIT(FILE_RANGE_OPERATION_CLONE) |
+				BIT(FILE_RANGE_OPERATION_DEDUPE),
 	.resolve	= fuse_passthrough_file_range_resolve,
 	.prepare_write	= fuse_passthrough_file_range_prepare_write,
 	.finish_write	= fuse_passthrough_file_range_finish_write,
