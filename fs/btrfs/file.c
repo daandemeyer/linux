@@ -3860,7 +3860,8 @@ const struct file_operations btrfs_file_operations = {
 	.uring_cmd	= btrfs_uring_cmd,
 	.fop_flags	= FOP_BUFFER_RASYNC | FOP_BUFFER_WASYNC |
 			  FOP_COPY_FILE_RANGE_BACKING |
-			  FOP_CLONE_FILE_RANGE_BACKING,
+			  FOP_CLONE_FILE_RANGE_BACKING |
+			  FOP_DEDUPE_FILE_RANGE_BACKING,
 	.setlease	= generic_setlease,
 };
 
