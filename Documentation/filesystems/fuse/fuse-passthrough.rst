@@ -23,7 +23,29 @@ the ``OPEN`` request, include this ``backing_id`` and set the
 operations.
 
 Currently, passthrough is supported for operations like ``read(2)``/``write(2)``
-(via ``read_iter``/``write_iter``), ``splice(2)``, and ``mmap(2)``.
+(via ``read_iter``/``write_iter``), ``splice(2)``, ``copy_file_range(2)``,
+and ``mmap(2)``.
+
+File Range Operations
+=====================
+
+For an actual passthrough open without ``FOPEN_DIRECT_IO``, the common VFS
+file range engine may resolve the FUSE file to its backing file.  It can then
+use a compatible terminal filesystem operation when either the source or the
+destination is passthrough.  The VFS revalidates the backing destination and
+brackets the terminal write with the FUSE inode lock, privilege removal, size
+update, and write freeze.
+
+Newly reachable terminal pairs must share a superblock and a
+``file_operations`` table which advertises the corresponding
+``FOP_COPY_FILE_RANGE_BACKING`` flag. Copy uses its remap operation when
+present and terminal splice otherwise.
+
+An exact FUSE pair retains the FUSE ``copy_file_range`` method, including its
+daemon policy and splice fallback.  Non-passthrough and direct-I/O opens decline
+backing-file resolution.  The non-NULL FUSE copy method takes precedence over
+the shared layer table for copy, so an exact FUSE copy pair is not resolved as
+paired layers.
 
 Enabling Passthrough
 ====================

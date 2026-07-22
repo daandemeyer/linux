@@ -25,6 +25,75 @@ static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
 	fuse_write_update_attr(inode, iocb->ki_pos, ret);
 }
 
+static struct file *
+fuse_passthrough_file_range_resolve(struct file *file,
+				    enum file_range_operation operation,
+				    enum file_range_role role,
+				    enum file_range_resolve_mode mode)
+{
+	struct fuse_file *ff = file->private_data;
+	struct file *backing_file = fuse_file_passthrough(ff);
+
+	if (!backing_file || (ff->open_flags & FOPEN_DIRECT_IO))
+		return ERR_PTR(-EXDEV);
+	if (fuse_is_bad(file_inode(file)))
+		return ERR_PTR(-EIO);
+
+	return get_file(backing_file);
+}
+
+static int
+fuse_passthrough_file_range_prepare_write(struct file *file, struct file *next,
+					  enum file_range_operation operation)
+{
+	struct fuse_file *ff = file->private_data;
+	struct inode *inode = file_inode(file);
+	int ret;
+
+	/* Recheck the stable per-open target without nesting backing locks. */
+	inode_lock(inode);
+	if (fuse_is_bad(inode)) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+	if (fuse_file_passthrough(ff) != next) {
+		ret = -EXDEV;
+		goto out_unlock;
+	}
+
+	ret = file_remove_privs(file);
+	if (ret)
+		goto out_unlock;
+	inode_unlock(inode);
+	return 0;
+
+out_unlock:
+	inode_unlock(inode);
+	return ret;
+}
+
+static void
+fuse_passthrough_file_range_finish_write(struct file *file, struct file *next,
+					 enum file_range_operation operation,
+					 loff_t pos_out, s64 ret)
+{
+	loff_t pos = ret > 0 ? pos_out + ret : pos_out;
+	ssize_t written = ret > 0 ? 1 : ret;
+
+	inode_lock(file_inode(file));
+	fuse_write_update_attr(file_inode(file), pos, written);
+	inode_unlock(file_inode(file));
+}
+
+/* Exact FUSE copy pairs keep fuse_copy_file_range(); remaps are resolved. */
+const struct file_range_layer_operations fuse_passthrough_file_range_layer_ops = {
+	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY),
+	.resolve	= fuse_passthrough_file_range_resolve,
+	.prepare_write	= fuse_passthrough_file_range_prepare_write,
+	.finish_write	= fuse_passthrough_file_range_finish_write,
+	.sync_source_access = fuse_file_accessed,
+};
+
 ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;

@@ -3095,6 +3095,9 @@ static const struct file_operations fuse_file_operations = {
 	.poll		= fuse_file_poll,
 	.fallocate	= fuse_file_fallocate,
 	.copy_file_range = fuse_copy_file_range,
+#ifdef CONFIG_FUSE_PASSTHROUGH
+	.file_range_layer_ops = &fuse_passthrough_file_range_layer_ops,
+#endif
 	.setlease	= generic_setlease,
 };
 
