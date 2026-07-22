@@ -187,6 +187,29 @@ static int compare_files(const char *left, const char *right)
 	}
 }
 
+static int clone_range_once(const char *source, const char *destination,
+			    loff_t pos_in, loff_t pos_out, uint64_t len)
+{
+	struct file_clone_range range = {
+		.src_offset = pos_in,
+		.src_length = len,
+		.dest_offset = pos_out,
+	};
+
+	int source_fd __free(close_fd) = open(source, O_RDONLY | O_CLOEXEC);
+
+	if (source_fd < 0)
+		return -errno;
+
+	int destination_fd __free(close_fd) =
+		open(destination, O_WRONLY | O_CLOEXEC);
+
+	if (destination_fd < 0)
+		return -errno;
+	range.src_fd = source_fd;
+	return ioctl(destination_fd, FICLONERANGE, &range) ? -errno : 0;
+}
+
 static void cleanup_fixture(struct _test_data_file_range *self)
 {
 	char merged[PATH_MAX];
@@ -533,6 +556,25 @@ TEST_F(file_range, paired_overlay_accounting)
 			       "merged/paired-accounting"));
 	ASSERT_EQ(0, create_empty_file(destination));
 	check_accounting(_metadata, source, destination);
+}
+
+TEST_F(file_range, clone_reaches_terminal_filesystem)
+{
+	char source[PATH_MAX], destination[PATH_MAX];
+	struct stat st;
+	int ret;
+
+	ASSERT_EQ(0, make_path(source, sizeof(source), self->root,
+			       "merged/data"));
+	ASSERT_EQ(0, make_path(destination, sizeof(destination), self->root,
+			       "merged/clone-destination"));
+	ASSERT_EQ(0, create_empty_file(destination));
+
+	/* Both OverlayFS files resolve before tmpfs rejects reflink support. */
+	ret = clone_range_once(source, destination, 0, 0, FILE_SIZE);
+	EXPECT_EQ(-EOPNOTSUPP, ret);
+	ASSERT_EQ(0, stat(destination, &st));
+	EXPECT_EQ(0, st.st_size);
 }
 
 static bool fanotify_unavailable(int error)
