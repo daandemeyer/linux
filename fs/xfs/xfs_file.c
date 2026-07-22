@@ -2102,7 +2102,8 @@ const struct file_operations xfs_file_operations = {
 	.remap_file_range = xfs_file_remap_range,
 	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC |
 			  FOP_BUFFER_WASYNC | FOP_DIO_PARALLEL_WRITE |
-			  FOP_DONTCACHE | FOP_COPY_FILE_RANGE_BACKING,
+			  FOP_DONTCACHE | FOP_COPY_FILE_RANGE_BACKING |
+			  FOP_CLONE_FILE_RANGE_BACKING,
 	.setlease	= generic_setlease,
 };
 
