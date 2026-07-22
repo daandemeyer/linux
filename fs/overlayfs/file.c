@@ -602,7 +602,8 @@ static void ovl_file_range_finish_write(struct file *file, struct file *next,
 }
 
 static const struct file_range_layer_operations ovl_file_range_layer_ops = {
-	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY),
+	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
+				BIT(FILE_RANGE_OPERATION_CLONE),
 	.resolve	= ovl_file_range_resolve,
 	.prepare_write	= ovl_file_range_prepare_write,
 	.finish_write	= ovl_file_range_finish_write,
