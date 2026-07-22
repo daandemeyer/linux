@@ -87,7 +87,8 @@ fuse_passthrough_file_range_finish_write(struct file *file, struct file *next,
 
 /* Exact FUSE copy pairs keep fuse_copy_file_range(); remaps are resolved. */
 const struct file_range_layer_operations fuse_passthrough_file_range_layer_ops = {
-	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY),
+	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
+				BIT(FILE_RANGE_OPERATION_CLONE),
 	.resolve	= fuse_passthrough_file_range_resolve,
 	.prepare_write	= fuse_passthrough_file_range_prepare_write,
 	.finish_write	= fuse_passthrough_file_range_finish_write,

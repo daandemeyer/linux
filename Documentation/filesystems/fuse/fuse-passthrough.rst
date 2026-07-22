@@ -24,7 +24,7 @@ operations.
 
 Currently, passthrough is supported for operations like ``read(2)``/``write(2)``
 (via ``read_iter``/``write_iter``), ``splice(2)``, ``copy_file_range(2)``,
-and ``mmap(2)``.
+``FICLONE``/``FICLONERANGE``, and ``mmap(2)``.
 
 File Range Operations
 =====================
@@ -38,14 +38,16 @@ update, and write freeze.
 
 Newly reachable terminal pairs must share a superblock and a
 ``file_operations`` table which advertises the corresponding
-``FOP_COPY_FILE_RANGE_BACKING`` flag. Copy uses its remap operation when
-present and terminal splice otherwise.
+``FOP_COPY_FILE_RANGE_BACKING`` or ``FOP_CLONE_FILE_RANGE_BACKING`` flag.
+Copy uses its remap operation when present and terminal splice otherwise.
+Clone requires the terminal remap operation and never falls back to splice.
 
 An exact FUSE pair retains the FUSE ``copy_file_range`` method, including its
 daemon policy and splice fallback.  Non-passthrough and direct-I/O opens decline
 backing-file resolution.  The non-NULL FUSE copy method takes precedence over
 the shared layer table for copy, so an exact FUSE copy pair is not resolved as
-paired layers.
+paired layers. FUSE has no clone method, so passthrough clone pairs resolve to
+their backing files.
 
 Enabling Passthrough
 ====================
