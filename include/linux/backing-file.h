@@ -14,6 +14,7 @@
 
 enum file_range_operation {
 	FILE_RANGE_OPERATION_COPY,
+	FILE_RANGE_OPERATION_CLONE,
 };
 
 enum file_range_role {

@@ -1991,6 +1991,8 @@ struct file_operations {
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
 /* copy_file_range is safe with backing files */
 #define FOP_COPY_FILE_RANGE_BACKING	((__force fop_flags_t)(1 << 8))
+/* remap_file_range cloning is safe with backing files */
+#define FOP_CLONE_FILE_RANGE_BACKING	((__force fop_flags_t)(1 << 9))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,

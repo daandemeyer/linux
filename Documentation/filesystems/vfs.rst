@@ -1151,12 +1151,12 @@ otherwise noted.
 
 ``file_range_layer_ops``
 	describes how one stackable filesystem layer participates in
-	``copy_file_range`` operations.  ``supported_operations``
+	``copy_file_range`` and clone operations.  ``supported_operations``
 	explicitly selects the operations which may traverse the layer.  A file
 	without this operations table is a terminal endpoint.  Resolution may
 	traverse multiple layers synchronously, and the
 	same ``resolve`` method is used for source and destination endpoints.  The
-	``operation`` argument identifies copy and ``role`` identifies
+	``operation`` argument identifies copy or clone and ``role`` identifies
 	whether the returned backing file will be read or written.
 
 	On success, ``resolve`` must return a referenced, already-open regular file
@@ -1181,8 +1181,9 @@ otherwise noted.
 	``FILE_RANGE_RESOLVE_MAY_OPEN`` could establish the endpoint.
 
 	``FILE_RANGE_RESOLVE_MAY_OPEN`` is used after the logical files have passed
-	authorization, and copy uses it only for a nonempty request.  It is called
-	without a write freeze or inode lock held.  It may establish
+	authorization.  Copy uses it only for a nonempty request.  Clone may use it
+	for a zero length because zero means through the end of the source file.  It
+	is called without a write freeze or inode lock held.  It may establish
 	transient per-open or cached state, including opening an existing backing
 	object, but must not copy up data or change file data, ``i_size``, the
 	namespace, or persistent metadata.  Backing-file range authorization has not
@@ -1225,9 +1226,10 @@ otherwise noted.
 	identity, even when the files have different complete ``file_operations``
 	tables.  Layers form a pair only when they share the same non-NULL
 	``file_range_layer_ops`` table, that table supports the requested operation,
-	and no authoritative method exists at that layer.  An identical non-NULL
-	``copy_file_range`` method is authoritative.  Matching layers are resolved
-	in pairs.  Each endpoint is
+	and no authoritative method exists at that layer.  For copy, an identical
+	non-NULL ``copy_file_range`` method is authoritative.  For clone, a source
+	``remap_file_range`` method on the same superblock is authoritative.
+	Matching layers are resolved in pairs.  Each endpoint is
 	resolved through the table installed on its own current file; the VFS never
 	selects one endpoint's layer table to operate on the other.  Sharing a table
 	is therefore an explicit declaration that it is valid for both file types.
@@ -1246,27 +1248,38 @@ otherwise noted.
 	resolved prefix.  Two opens of the same logical inode retain the ordinary
 	non-overlap rule even when their per-open chains differ.
 
+	Clone uses only the terminal source ``remap_file_range`` method and never
+	falls back to splice.  A zero clone length is passed through unchanged and
+	means to clone through the end of the source file.  Both ``FICLONE`` and
+	``FICLONERANGE`` use this route through ``vfs_clone_file_range``.
+
 	Installing the layer table on file operations without a copy method asserts
 	that paired resolution preserves the layer's copy semantics, including
 	ordinary terminal dispatch on every backing pair it may return without the
-	terminal opt-in.  A non-paired logical route which is otherwise compatible
+	terminal opt-in.  Advertising clone support makes the corresponding
+	assertion for every backing pair: ordinary same-superblock dispatch may use
+	the source ``remap_file_range`` method even when the terminal files have
+	different ``file_operations`` tables.  Both files still belong to the same
+	filesystem instance, and the shared layer table asserts that exposing this
+	pair is safe.  A non-paired logical route which is otherwise compatible
 	executes on the original files.
 
-	``FOP_COPY_FILE_RANGE_BACKING`` is a terminal-operation opt-in, not a
-	resolver.  It asserts that the terminal ``file_operations`` table supports
-	copy between a mixture of user-visible and ``FMODE_BACKING`` files, executing
-	in the destination chain's credential domain.  In particular, the terminal
-	operation must not
+	``FOP_COPY_FILE_RANGE_BACKING`` and ``FOP_CLONE_FILE_RANGE_BACKING`` are
+	independent terminal-operation opt-ins, not resolvers.  Each asserts that the
+	terminal ``file_operations`` table supports that operation between a mixture
+	of user-visible and ``FMODE_BACKING`` files, executing in the destination
+	chain's credential domain.  In particular, the terminal operations must not
 	require a wrapper path or
 	private state which is absent from the files passed to them, or assume that
 	the current credentials match the source file's ``f_cred``.
 
 	When endpoint translation does not form a paired route, both terminal files
 	must be on the same superblock and have the same ``file_operations`` table.
-	That table must advertise the copy opt-in.  Copy may use
-	``remap_file_range`` and fall back to terminal splice for unaligned offsets
-	or a zero result; without a remap method copy uses terminal splice directly.
-	The splice callbacks and any read or write methods they
+	That table must advertise the opt-in for the requested operation.  If it
+	provides ``remap_file_range``, the VFS uses that operation for clone.  Copy
+	may use it and fall back to terminal splice for unaligned offsets or a zero
+	result; without a remap method copy uses terminal splice directly.  Clone
+	never falls back.  The splice callbacks and any read or write methods they
 	call are part of the opt-in audit.  Exact table identity prevents the VFS
 	from choosing between unrelated terminal filesystem implementations.
 
