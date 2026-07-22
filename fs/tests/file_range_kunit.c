@@ -14,6 +14,7 @@
 #include <linux/mount.h>
 #include <linux/percpu.h>
 #include <linux/pseudo_fs.h>
+#include <linux/splice.h>
 
 #include "../internal.h"
 
@@ -57,6 +58,9 @@ struct file_range_test_ctx {
 	unsigned int deeper_resolve_calls;
 	unsigned int remap_calls;
 	unsigned int splice_calls;
+	unsigned int layer_splice_read_calls;
+	unsigned int layer_splice_write_calls;
+	unsigned int sync_source_access_calls;
 	unsigned int nr_events;
 	unsigned int events[FILE_RANGE_TEST_MAX_EVENTS];
 	s64 finish_ret[2];
@@ -67,12 +71,16 @@ struct file_range_test_ctx {
 	const struct cred *finish_creds[2];
 	const struct cred *copy_cred;
 	const struct cred *remap_cred;
+	const struct cred *splice_read_cred;
+	const struct cred *splice_write_cred;
+	const struct cred *sync_source_access_creds[2];
 	enum file_range_operation resolve_operation;
 	enum file_range_operation prepare_operation;
 	enum file_range_operation finish_operation;
 	unsigned int revalidate_file_write_readers[2];
 	unsigned int revalidate_next_write_readers[2];
 	unsigned int remap_flags;
+	unsigned int splice_write_readers;
 	loff_t remap_ret;
 	struct file_range_test_freeze *freeze;
 	bool record_revalidate_write_readers;
@@ -310,13 +318,55 @@ file_range_test_splice_read(struct file *file, loff_t *ppos,
 	return -ENODATA;
 }
 
+static ssize_t
+file_range_test_layer_splice_read(struct file *file, loff_t *ppos,
+				  struct pipe_inode_info *pipe, size_t len,
+				  unsigned int flags)
+{
+	struct file_range_test_file *test_file = file->private_data;
+	struct file_range_test_ctx *ctx = test_file->ctx;
+
+	ctx->layer_splice_read_calls++;
+	ctx->splice_read_cred = current_cred();
+	*ppos += len;
+	return len;
+}
+
+static ssize_t
+file_range_test_layer_splice_write(struct pipe_inode_info *pipe,
+				   struct file *file, loff_t *ppos,
+				   size_t len, unsigned int flags)
+{
+	struct file_range_test_file *test_file = file->private_data;
+	struct file_range_test_ctx *ctx = test_file->ctx;
+
+	ctx->layer_splice_write_calls++;
+	ctx->splice_write_cred = current_cred();
+	ctx->splice_write_readers =
+		file_range_test_write_readers(file_inode(file)->i_sb);
+	*ppos += len;
+	return len;
+}
+
+static void file_range_test_sync_source_access(struct file *file)
+{
+	struct file_range_test_file *test_file = file->private_data;
+	struct file_range_test_ctx *ctx = test_file->ctx;
+	unsigned int call = ctx->sync_source_access_calls++;
+
+	if (call < ARRAY_SIZE(ctx->sync_source_access_creds))
+		ctx->sync_source_access_creds[call] = current_cred();
+}
+
 static const struct file_range_layer_operations file_range_test_layer_ops = {
 	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
 				BIT(FILE_RANGE_OPERATION_CLONE) |
-				BIT(FILE_RANGE_OPERATION_DEDUPE),
+				BIT(FILE_RANGE_OPERATION_DEDUPE) |
+				BIT(FILE_RANGE_OPERATION_SPLICE),
 	.resolve = file_range_test_resolve,
 	.prepare_write = file_range_test_prepare,
 	.finish_write = file_range_test_finish,
+	.sync_source_access = file_range_test_sync_source_access,
 };
 
 static const struct file_range_layer_operations
@@ -363,6 +413,12 @@ static const struct file_operations file_range_test_clone_remap_wrapper_fops = {
 	.file_range_layer_ops = &file_range_test_clone_layer_ops,
 };
 
+static const struct file_operations file_range_test_opaque_splice_fops = {
+	.splice_read = file_range_test_layer_splice_read,
+	.splice_write = file_range_test_layer_splice_write,
+	.file_range_layer_ops = &file_range_test_layer_ops,
+};
+
 static const struct file_operations file_range_test_method_wrapper_fops[] = {
 	{
 		.copy_file_range = file_range_test_copy,
@@ -385,10 +441,14 @@ static const struct file_operations file_range_test_exact_method_fops = {
 static const struct file_operations file_range_test_terminal_fops[] = {
 	{
 		.copy_file_range = file_range_test_copy,
+		.splice_read = file_range_test_layer_splice_read,
+		.splice_write = file_range_test_layer_splice_write,
 		.file_range_layer_ops = &file_range_test_fail_layer_ops[0],
 	},
 	{
 		.copy_file_range = file_range_test_copy,
+		.splice_read = file_range_test_layer_splice_read,
+		.splice_write = file_range_test_layer_splice_write,
 		.file_range_layer_ops = &file_range_test_fail_layer_ops[1],
 	},
 };
@@ -1692,6 +1752,124 @@ static void file_range_test_dedupe_uses_destination_method(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->remap_calls, 1U);
 }
 
+static void file_range_test_splice_source_layers(struct kunit *test)
+{
+	CLASS(prepare_creds, source_cred)();
+	CLASS(prepare_creds, terminal_cred)();
+	const struct cred *caller_cred = current_cred();
+	struct file_range_test_route *route;
+	unsigned long refs[2][2];
+	loff_t pos = 64;
+	ssize_t ret;
+
+	route = alloc_cred_route(test, source_cred, terminal_cred,
+				 current_cred(), current_cred());
+	file_range_test_get_refs(route, refs);
+
+	ret = file_range_splice_read(route->files[FILE_RANGE_SOURCE][0], &pos,
+				     NULL, 512, SPLICE_F_MORE);
+	KUNIT_EXPECT_EQ(test, ret, (ssize_t)512);
+	KUNIT_EXPECT_EQ(test, pos, (loff_t)576);
+	KUNIT_EXPECT_EQ(test, route->ctx.resolve_operation,
+			FILE_RANGE_OPERATION_SPLICE);
+	KUNIT_EXPECT_EQ(test, route->ctx.layer_splice_read_calls, 1U);
+	KUNIT_EXPECT_EQ(test, route->ctx.sync_source_access_calls, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.splice_read_cred, terminal_cred);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    route->ctx.resolve_creds[0][FILE_RANGE_SOURCE]
+					    [FILE_RANGE_RESOLVE_MAY_OPEN],
+			    caller_cred);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    route->ctx.resolve_creds[1][FILE_RANGE_SOURCE]
+					    [FILE_RANGE_RESOLVE_MAY_OPEN],
+			    source_cred);
+	KUNIT_EXPECT_PTR_EQ(test, current_cred(), caller_cred);
+	file_range_test_expect_refs(test, route, refs);
+}
+
+static void file_range_test_splice_destination_layers(struct kunit *test)
+{
+	static const unsigned int expected_events[] = {
+		FILE_RANGE_TEST_PREPARE_0,
+		FILE_RANGE_TEST_PREPARE_1,
+		FILE_RANGE_TEST_FINISH_1,
+		FILE_RANGE_TEST_FINISH_0,
+	};
+	CLASS(prepare_creds, destination_cred)();
+	CLASS(prepare_creds, terminal_cred)();
+	const struct cred *caller_cred = current_cred();
+	struct file_range_test_route *route;
+	struct file *destination;
+	unsigned long refs[2][2];
+	loff_t pos = 128;
+	ssize_t ret;
+	unsigned int i;
+
+	route = alloc_cred_route(test, current_cred(), current_cred(),
+				 destination_cred, terminal_cred);
+	destination = route->files[FILE_RANGE_DESTINATION][0];
+	file_range_test_get_refs(route, refs);
+
+	file_start_write(destination);
+	ret = file_range_splice_write(NULL, destination, &pos, 512,
+				      SPLICE_F_MORE);
+	file_end_write(destination);
+
+	KUNIT_EXPECT_EQ(test, ret, (ssize_t)512);
+	KUNIT_EXPECT_EQ(test, pos, (loff_t)640);
+	KUNIT_EXPECT_EQ(test, route->ctx.resolve_operation,
+			FILE_RANGE_OPERATION_SPLICE);
+	KUNIT_EXPECT_EQ(test, route->ctx.prepare_operation,
+			FILE_RANGE_OPERATION_SPLICE);
+	KUNIT_EXPECT_EQ(test, route->ctx.finish_operation,
+			FILE_RANGE_OPERATION_SPLICE);
+	KUNIT_EXPECT_EQ(test, route->ctx.layer_splice_write_calls, 1U);
+	KUNIT_EXPECT_EQ(test, route->ctx.prepare_calls, 2U);
+	KUNIT_EXPECT_EQ(test, route->ctx.finish_calls, 2U);
+	KUNIT_EXPECT_EQ(test, route->ctx.splice_write_readers, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.prepare_creds[0], caller_cred);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.prepare_creds[1],
+			    destination_cred);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.splice_write_cred, terminal_cred);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.finish_creds[1],
+			    destination_cred);
+	KUNIT_EXPECT_PTR_EQ(test, route->ctx.finish_creds[0], caller_cred);
+	KUNIT_ASSERT_EQ(test, route->ctx.nr_events,
+			(unsigned int)ARRAY_SIZE(expected_events));
+	for (i = 0; i < ARRAY_SIZE(expected_events); i++)
+		KUNIT_EXPECT_EQ(test, route->ctx.events[i], expected_events[i]);
+	KUNIT_EXPECT_PTR_EQ(test, current_cred(), caller_cred);
+	file_range_test_expect_refs(test, route, refs);
+}
+
+static void file_range_test_splice_opaque_layer(struct kunit *test)
+{
+	struct file_range_test_ctx *ctx;
+	struct file_range_test_layered_file *file;
+	struct vfsmount *mounts[3];
+	unsigned long backing_refs;
+	loff_t pos = 0;
+	ssize_t ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	file_range_test_init_mounts(test, mounts);
+	file = alloc_layered_file(test, ctx, mounts[1], mounts[2],
+				  &file_range_test_opaque_splice_fops,
+				  &file_range_test_terminal_fops[0]);
+	file->wrapper_private.resolve_error = -EOPNOTSUPP;
+	file->wrapper_private.resolve_error_role = FILE_RANGE_SOURCE;
+	file->wrapper_private.resolve_error_mode = FILE_RANGE_RESOLVE_MAY_OPEN;
+	backing_refs = file_count(file->backing);
+
+	ret = file_range_splice_read(file->wrapper, &pos, NULL, 512, 0);
+	KUNIT_EXPECT_EQ(test, ret, (ssize_t)512);
+	KUNIT_EXPECT_EQ(test, pos, (loff_t)512);
+	KUNIT_EXPECT_EQ(test, ctx->layer_splice_read_calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->sync_source_access_calls, 0U);
+	KUNIT_EXPECT_EQ(test, file_count(file->backing), backing_refs);
+}
+
 static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_paired_dispatch),
 	KUNIT_CASE(file_range_test_credential_domains),
@@ -1718,6 +1896,9 @@ static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_zero_length_dedupe_resolves),
 	KUNIT_CASE(file_range_test_paired_zero_length_dedupe),
 	KUNIT_CASE(file_range_test_dedupe_uses_destination_method),
+	KUNIT_CASE(file_range_test_splice_source_layers),
+	KUNIT_CASE(file_range_test_splice_destination_layers),
+	KUNIT_CASE(file_range_test_splice_opaque_layer),
 	{},
 };
 
