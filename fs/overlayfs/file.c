@@ -396,70 +396,6 @@ out_unlock:
 	return ret;
 }
 
-static ssize_t ovl_splice_read(struct file *in, loff_t *ppos,
-			       struct pipe_inode_info *pipe, size_t len,
-			       unsigned int flags)
-{
-	struct file *realfile;
-	ssize_t ret;
-	struct backing_file_ctx ctx = {
-		.cred = ovl_creds(file_inode(in)->i_sb),
-		.accessed = ovl_file_accessed,
-	};
-	struct kiocb iocb;
-
-	realfile = ovl_real_file(in);
-	if (IS_ERR(realfile))
-		return PTR_ERR(realfile);
-
-	init_sync_kiocb(&iocb, in);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_read(realfile, &iocb, pipe, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
-
-	return ret;
-}
-
-/*
- * Calling iter_file_splice_write() directly from overlay's f_op may deadlock
- * due to lock order inversion between pipe->mutex in iter_file_splice_write()
- * and file_start_write(realfile) in ovl_write_iter().
- *
- * So do everything ovl_write_iter() does and call iter_file_splice_write() on
- * the real file.
- */
-static ssize_t ovl_splice_write(struct pipe_inode_info *pipe, struct file *out,
-				loff_t *ppos, size_t len, unsigned int flags)
-{
-	struct file *realfile;
-	struct inode *inode = file_inode(out);
-	ssize_t ret;
-	struct backing_file_ctx ctx = {
-		.cred = ovl_creds(inode->i_sb),
-		.end_write = ovl_file_end_write,
-	};
-	struct kiocb iocb;
-
-	inode_lock(inode);
-	/* Update mode */
-	ovl_copyattr(inode);
-
-	realfile = ovl_real_file(out);
-	ret = PTR_ERR(realfile);
-	if (IS_ERR(realfile))
-		goto out_unlock;
-
-	init_sync_kiocb(&iocb, out);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_write(pipe, realfile, &iocb, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
-
-out_unlock:
-	inode_unlock(inode);
-
-	return ret;
-}
-
 static int ovl_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct dentry *dentry = file_dentry(file);
@@ -615,7 +551,8 @@ static void ovl_file_range_finish_write(struct file *file, struct file *next,
 static const struct file_range_layer_operations ovl_file_range_layer_ops = {
 	.supported_operations = BIT(FILE_RANGE_OPERATION_COPY) |
 				BIT(FILE_RANGE_OPERATION_CLONE) |
-				BIT(FILE_RANGE_OPERATION_DEDUPE),
+				BIT(FILE_RANGE_OPERATION_DEDUPE) |
+				BIT(FILE_RANGE_OPERATION_SPLICE),
 	.resolve	= ovl_file_range_resolve,
 	.prepare_write	= ovl_file_range_prepare_write,
 	.finish_write	= ovl_file_range_finish_write,
@@ -650,8 +587,8 @@ const struct file_operations ovl_file_operations = {
 	.fallocate	= ovl_fallocate,
 	.fadvise	= ovl_fadvise,
 	.flush		= ovl_flush,
-	.splice_read    = ovl_splice_read,
-	.splice_write   = ovl_splice_write,
+	.splice_read    = filemap_splice_read,
+	.splice_write   = iter_file_splice_write,
 
 	.file_range_layer_ops	= &ovl_file_range_layer_ops,
 	.setlease		= generic_setlease,
