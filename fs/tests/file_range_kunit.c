@@ -1870,6 +1870,23 @@ static void file_range_test_splice_opaque_layer(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, file_count(file->backing), backing_refs);
 }
 
+static void file_range_test_can_splice_read(struct kunit *test)
+{
+	struct file file = {};
+
+	file.f_op = &file_range_test_terminal_fops[0];
+	KUNIT_EXPECT_TRUE(test, file_can_splice_read(&file));
+
+	file.f_op = &file_range_test_wrapper_fops;
+	KUNIT_EXPECT_TRUE(test, file_can_splice_read(&file));
+
+	file.f_op = &file_range_test_exact_method_fops;
+	KUNIT_EXPECT_FALSE(test, file_can_splice_read(&file));
+
+	file.f_op = &file_range_test_unflagged_fops;
+	KUNIT_EXPECT_FALSE(test, file_can_splice_read(&file));
+}
+
 static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_paired_dispatch),
 	KUNIT_CASE(file_range_test_credential_domains),
@@ -1899,6 +1916,7 @@ static struct kunit_case file_range_test_cases[] = {
 	KUNIT_CASE(file_range_test_splice_source_layers),
 	KUNIT_CASE(file_range_test_splice_destination_layers),
 	KUNIT_CASE(file_range_test_splice_opaque_layer),
+	KUNIT_CASE(file_range_test_can_splice_read),
 	{},
 };
 
