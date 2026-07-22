@@ -1913,6 +1913,14 @@ struct dir_context {
  */
 #define COPY_FILE_SPLICE		(1 << 0)
 
+/*
+ * A stackable filesystem cannot safely recurse through all file range
+ * operations: source-side recursion can acquire the same destination write
+ * freeze twice.  Layer operations let the VFS own one freeze for every
+ * destination layer.
+ */
+struct file_range_layer_operations;
+
 struct io_uring_cmd;
 struct offset_ctx;
 
@@ -1954,6 +1962,7 @@ struct file_operations {
 #endif
 	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *,
 			loff_t, size_t, unsigned int);
+	const struct file_range_layer_operations *file_range_layer_ops;
 	loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in,
 				   struct file *file_out, loff_t pos_out,
 				   loff_t len, unsigned int remap_flags);
@@ -1980,6 +1989,8 @@ struct file_operations {
 #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
+/* copy_file_range is safe with backing files */
+#define FOP_COPY_FILE_RANGE_BACKING	((__force fop_flags_t)(1 << 8))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
