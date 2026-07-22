@@ -550,7 +550,10 @@ state.  Both modes return a referenced file which the VFS will put.
 
 All logical and backing permission checks complete before destination write
 freezes and inode locks are taken, because permission hooks may mutate an
-endpoint.  At each destination layer the VFS freezes the wrapper, calls
+endpoint.  Dedupe additionally takes mount write access for each destination
+after its permission check, separately from freeze protection, so the same
+superblock freeze is not recursively acquired.  At each destination layer the
+VFS freezes the wrapper, calls
 ``prepare_write``, and recurses.  It then calls ``finish_write`` and unfreezes
 the wrapper.  ``prepare_write`` must revalidate its exact backing file.  If it
 succeeds, ``finish_write`` will be called exactly once, even if a nested

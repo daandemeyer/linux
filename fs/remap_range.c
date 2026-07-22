@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/slab.h>
+#include <linux/backing-file.h>
 #include <linux/stat.h>
 #include <linux/sched/xacct.h>
 #include <linux/fcntl.h>
@@ -373,83 +374,6 @@ int generic_remap_file_range_prep(struct file *file_in, loff_t pos_in,
 }
 EXPORT_SYMBOL(generic_remap_file_range_prep);
 
-/* Check whether we are allowed to dedupe the destination file */
-static bool may_dedupe_file(struct file *file)
-{
-	struct mnt_idmap *idmap = file_mnt_idmap(file);
-	struct inode *inode = file_inode(file);
-
-	if (capable(CAP_SYS_ADMIN))
-		return true;
-	if (file->f_mode & FMODE_WRITE)
-		return true;
-	if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), current_fsuid()))
-		return true;
-	if (!inode_permission(idmap, inode, MAY_WRITE))
-		return true;
-	return false;
-}
-
-loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
-				 struct file *dst_file, loff_t dst_pos,
-				 loff_t len, unsigned int remap_flags)
-{
-	loff_t ret;
-
-	WARN_ON_ONCE(remap_flags & ~(REMAP_FILE_DEDUP |
-				     REMAP_FILE_CAN_SHORTEN));
-
-	/*
-	 * This is redundant if called from vfs_dedupe_file_range(), but other
-	 * callers need it and it's not performance sesitive...
-	 */
-	ret = remap_verify_area(src_file, src_pos, len, false);
-	if (ret)
-		return ret;
-
-	ret = remap_verify_area(dst_file, dst_pos, len, true);
-	if (ret)
-		return ret;
-
-	/*
-	 * This needs to be called after remap_verify_area() because of
-	 * sb_start_write() and before may_dedupe_file() because the mount's
-	 * MAY_WRITE need to be checked with mnt_get_write_access_file() held.
-	 */
-	ret = mnt_want_write_file(dst_file);
-	if (ret)
-		return ret;
-
-	ret = -EPERM;
-	if (!may_dedupe_file(dst_file))
-		goto out_drop_write;
-
-	ret = -EXDEV;
-	if (file_inode(src_file)->i_sb != file_inode(dst_file)->i_sb)
-		goto out_drop_write;
-
-	ret = -EISDIR;
-	if (S_ISDIR(file_inode(dst_file)->i_mode))
-		goto out_drop_write;
-
-	ret = -EINVAL;
-	if (!dst_file->f_op->remap_file_range)
-		goto out_drop_write;
-
-	if (len == 0) {
-		ret = 0;
-		goto out_drop_write;
-	}
-
-	ret = dst_file->f_op->remap_file_range(src_file, src_pos, dst_file,
-			dst_pos, len, remap_flags | REMAP_FILE_DEDUP);
-out_drop_write:
-	mnt_drop_write_file(dst_file);
-
-	return ret;
-}
-EXPORT_SYMBOL(vfs_dedupe_file_range_one);
-
 int vfs_dedupe_file_range(struct file *file, struct file_dedupe_range *same)
 {
 	struct file_dedupe_range_info *info;
@@ -476,7 +400,10 @@ int vfs_dedupe_file_range(struct file *file, struct file_dedupe_range *same)
 	if (!S_ISREG(src->i_mode))
 		return -EINVAL;
 
-	if (!file->f_op->remap_file_range)
+	if (!file->f_op->remap_file_range &&
+	    (!file->f_op->file_range_layer_ops ||
+	     !(file->f_op->file_range_layer_ops->supported_operations &
+	       BIT(FILE_RANGE_OPERATION_DEDUPE))))
 		return -EOPNOTSUPP;
 
 	ret = remap_verify_area(file, off, len, false);

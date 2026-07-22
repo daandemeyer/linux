@@ -1151,21 +1151,22 @@ otherwise noted.
 
 ``file_range_layer_ops``
 	describes how one stackable filesystem layer participates in
-	``copy_file_range`` and clone operations.  ``supported_operations``
+	``copy_file_range``, clone, and dedupe operations.  ``supported_operations``
 	explicitly selects the operations which may traverse the layer.  A file
 	without this operations table is a terminal endpoint.  Resolution may
 	traverse multiple layers synchronously, and the
 	same ``resolve`` method is used for source and destination endpoints.  The
-	``operation`` argument identifies copy or clone and ``role`` identifies
+	``operation`` identifies copy, clone, or dedupe and ``role`` identifies
 	whether the returned backing file will be read or written.
 
 	On success, ``resolve`` must return a referenced, already-open regular file
 	with ``FMODE_BACKING`` set.  The VFS consumes that reference and eventually
 	calls ``fput()``; returning a borrowed pointer or ``NULL`` is invalid.
 	Failures are returned with ``ERR_PTR()``.  A source file must have
-	``FMODE_READ`` and a destination file must have ``FMODE_WRITE``.  Every
-	transition must reduce ``s_stack_depth`` and must not return a file already
-	present in the endpoint chain.
+	``FMODE_READ``.  A destination file must have ``FMODE_WRITE`` except for
+	dedupe, whose ownership and write-permission rules allow a read-only file.
+	Every transition must reduce ``s_stack_depth`` and must not return a file
+	already present in the endpoint chain.
 
 	The backing file must use identity offset mapping: byte offset N in the
 	wrapper denotes byte offset N in the returned file.  Source size and EOF
@@ -1183,7 +1184,9 @@ otherwise noted.
 	``FILE_RANGE_RESOLVE_MAY_OPEN`` is used after the logical files have passed
 	authorization.  Copy uses it only for a nonempty request.  Clone may use it
 	for a zero length because zero means through the end of the source file.  It
-	is called without a write freeze or inode lock held.  It may establish
+	is also used for zero-length dedupe so that terminal compatibility and
+	backing authorization are preserved.  It is called without a write freeze
+	or inode lock held.  It may establish
 	transient per-open or cached state, including opening an existing backing
 	object, but must not copy up data or change file data, ``i_size``, the
 	namespace, or persistent metadata.  Backing-file range authorization has not
@@ -1226,9 +1229,12 @@ otherwise noted.
 	identity, even when the files have different complete ``file_operations``
 	tables.  Layers form a pair only when they share the same non-NULL
 	``file_range_layer_ops`` table, that table supports the requested operation,
-	and no authoritative method exists at that layer.  For copy, an identical
-	non-NULL ``copy_file_range`` method is authoritative.  For clone, a source
-	``remap_file_range`` method on the same superblock is authoritative.
+	and neither endpoint exposes the operation's ordinary file method.  For
+	copy, an identical non-NULL ``copy_file_range`` method is authoritative and
+	is selected before pairing.  For clone, the source ``remap_file_range``
+	method is authoritative; for dedupe, the destination method is
+	authoritative.  Requiring a method-free pair preserves ordinary dispatch for
+	asymmetric file-operation tables instead of silently bypassing one method.
 	Matching layers are resolved in pairs.  Each endpoint is
 	resolved through the table installed on its own current file; the VFS never
 	selects one endpoint's layer table to operate on the other.  Sharing a table
@@ -1252,20 +1258,24 @@ otherwise noted.
 	falls back to splice.  A zero clone length is passed through unchanged and
 	means to clone through the end of the source file.  Both ``FICLONE`` and
 	``FICLONERANGE`` use this route through ``vfs_clone_file_range``.
+	Dedupe uses the same terminal remap method with ``REMAP_FILE_DEDUP`` while
+	preserving the per-destination status reporting of ``FIDEDUPERANGE``.
 
 	Installing the layer table on file operations without a copy method asserts
 	that paired resolution preserves the layer's copy semantics, including
 	ordinary terminal dispatch on every backing pair it may return without the
 	terminal opt-in.  Advertising clone support makes the corresponding
-	assertion for every backing pair: ordinary same-superblock dispatch may use
-	the source ``remap_file_range`` method even when the terminal files have
+	assertion for every backing pair.  Advertising dedupe support makes the
+	same assertion for dedupe.  Ordinary same-superblock dispatch may use the
+	source ``remap_file_range`` method even when the terminal files have
 	different ``file_operations`` tables.  Both files still belong to the same
 	filesystem instance, and the shared layer table asserts that exposing this
 	pair is safe.  A non-paired logical route which is otherwise compatible
 	executes on the original files.
 
-	``FOP_COPY_FILE_RANGE_BACKING`` and ``FOP_CLONE_FILE_RANGE_BACKING`` are
-	independent terminal-operation opt-ins, not resolvers.  Each asserts that the
+	``FOP_COPY_FILE_RANGE_BACKING``, ``FOP_CLONE_FILE_RANGE_BACKING``, and
+	``FOP_DEDUPE_FILE_RANGE_BACKING`` are independent terminal-operation
+	opt-ins, not resolvers.  Each asserts that the
 	terminal ``file_operations`` table supports that operation between a mixture
 	of user-visible and ``FMODE_BACKING`` files, executing in the destination
 	chain's credential domain.  In particular, the terminal operations must not
@@ -1276,12 +1286,13 @@ otherwise noted.
 	When endpoint translation does not form a paired route, both terminal files
 	must be on the same superblock and have the same ``file_operations`` table.
 	That table must advertise the opt-in for the requested operation.  If it
-	provides ``remap_file_range``, the VFS uses that operation for clone.  Copy
-	may use it and fall back to terminal splice for unaligned offsets or a zero
-	result; without a remap method copy uses terminal splice directly.  Clone
-	never falls back.  The splice callbacks and any read or write methods they
-	call are part of the opt-in audit.  Exact table identity prevents the VFS
-	from choosing between unrelated terminal filesystem implementations.
+	provides ``remap_file_range``, the VFS uses that operation for clone or
+	dedupe.  Copy may use it and fall back to terminal splice for unaligned
+	offsets or a zero result; without a remap method copy uses terminal splice
+	directly.  Clone and dedupe never fall back.  The splice callbacks and any
+	read or write methods they call are part of the opt-in audit.  Exact table
+	identity prevents the VFS from choosing between unrelated terminal
+	filesystem implementations.
 
 	An opaque terminal ``copy_file_range`` method cannot admit a new route.  It
 	may update hidden source access state without telling the VFS whether the
@@ -1290,12 +1301,11 @@ otherwise noted.
 	require the terminal opt-in.
 
 	A positive remap result, including a short result, is returned to the caller.
-	Zero may fall back to splice and therefore must mean that the opted-in remap
-	made no destination change.  A negative operational error is preserved.
-	Routes reached through paired layers use the ordinary terminal fallback
-	rules.  A hidden swapfile declines a newly admitted route with ``-EXDEV``
-	instead of exposing ``-ETXTBSY`` that the logical file would not have
-	returned.
+	A non-positive result falls back to splice, matching ordinary
+	``copy_file_range`` dispatch, and therefore must mean that the remap made no
+	destination change.  A hidden swapfile declines a newly admitted route with
+	``-EXDEV`` instead of exposing ``-ETXTBSY`` that the logical file would not
+	have returned.
 
 	The VFS owns access and modify notification for the whole operation,
 	including translated files, and owns task I/O accounting for copy.  After

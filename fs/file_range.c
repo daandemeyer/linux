@@ -29,6 +29,7 @@ struct file_range_context {
 	loff_t pos_in;
 	loff_t pos_out;
 	unsigned int operation_flags;
+	unsigned int nr_write_access_files;
 	bool use_splice;
 	bool splice_attempted;
 	bool uses_terminal_opt_in;
@@ -60,6 +61,12 @@ static void file_range_context_init(struct file_range_context *ctx,
 
 static void file_range_context_cleanup(struct file_range_context *ctx)
 {
+	while (ctx->nr_write_access_files) {
+		unsigned int i = --ctx->nr_write_access_files;
+		struct file *file = ctx->destination.files[i];
+
+		mnt_put_write_access_file(file);
+	}
 	file_range_chain_reset(&ctx->source);
 	file_range_chain_reset(&ctx->destination);
 }
@@ -132,7 +139,8 @@ file_range_resolve_next(struct file_range_chain *chain,
 	if (role == FILE_RANGE_SOURCE) {
 		if (!(next->f_mode & FMODE_READ))
 			return -EBADF;
-	} else if (!(next->f_mode & FMODE_WRITE)) {
+	} else if (operation != FILE_RANGE_OPERATION_DEDUPE &&
+		   !(next->f_mode & FMODE_WRITE)) {
 		return -EBADF;
 	}
 	/* Stack depth must decrease, which also prevents cycles. */
@@ -164,10 +172,20 @@ file_range_chain_terminal(const struct file_range_chain *chain)
 	return chain->files[chain->nr_files - 1];
 }
 
+static struct file *
+file_range_remap_file(enum file_range_operation operation,
+		      struct file *file_in, struct file *file_out)
+{
+	if (operation == FILE_RANGE_OPERATION_DEDUPE)
+		return file_out;
+	return file_in;
+}
+
 static bool file_range_has_terminal_method(const struct file_range_context *ctx)
 {
 	struct file *file_in = file_range_chain_terminal(&ctx->source);
 	struct file *file_out = file_range_chain_terminal(&ctx->destination);
+	struct file *remap_file;
 
 	switch (ctx->operation) {
 	case FILE_RANGE_OPERATION_COPY:
@@ -175,8 +193,11 @@ static bool file_range_has_terminal_method(const struct file_range_context *ctx)
 		       file_in->f_op->copy_file_range ==
 			file_out->f_op->copy_file_range;
 	case FILE_RANGE_OPERATION_CLONE:
+	case FILE_RANGE_OPERATION_DEDUPE:
+		remap_file = file_range_remap_file(ctx->operation, file_in,
+						   file_out);
 		return file_inode(file_in)->i_sb == file_inode(file_out)->i_sb &&
-		       file_in->f_op->remap_file_range;
+		       remap_file->f_op->remap_file_range;
 	}
 
 	return false;
@@ -198,6 +219,7 @@ static bool file_range_paired_layers(enum file_range_operation operation,
 		return !file_in->f_op->copy_file_range &&
 		       !file_out->f_op->copy_file_range;
 	case FILE_RANGE_OPERATION_CLONE:
+	case FILE_RANGE_OPERATION_DEDUPE:
 		/* Advertised remap operations override the legacy callback. */
 		return true;
 	}
@@ -272,7 +294,7 @@ file_range_terminal_route_compatible(enum file_range_operation operation,
 				     struct file *file_in,
 				     struct file *file_out)
 {
-	if (operation == FILE_RANGE_OPERATION_CLONE)
+	if (operation != FILE_RANGE_OPERATION_COPY)
 		return file_inode(file_in)->i_sb == file_inode(file_out)->i_sb;
 	if (file_out->f_op->copy_file_range)
 		return file_in->f_op->copy_file_range ==
@@ -317,9 +339,21 @@ static bool
 file_range_terminal_supports_backing(enum file_range_operation operation,
 				     const struct file *file)
 {
-	fop_flags_t flag = operation == FILE_RANGE_OPERATION_COPY ?
-			   FOP_COPY_FILE_RANGE_BACKING :
-			   FOP_CLONE_FILE_RANGE_BACKING;
+	fop_flags_t flag;
+
+	switch (operation) {
+	case FILE_RANGE_OPERATION_COPY:
+		flag = FOP_COPY_FILE_RANGE_BACKING;
+		break;
+	case FILE_RANGE_OPERATION_CLONE:
+		flag = FOP_CLONE_FILE_RANGE_BACKING;
+		break;
+	case FILE_RANGE_OPERATION_DEDUPE:
+		flag = FOP_DEDUPE_FILE_RANGE_BACKING;
+		break;
+	default:
+		return false;
+	}
 
 	return file->f_op->fop_flags & flag;
 }
@@ -353,6 +387,8 @@ static int file_range_check_terminal_route(struct file_range_context *ctx)
 {
 	struct file *file_in = file_range_chain_terminal(&ctx->source);
 	struct file *file_out = file_range_chain_terminal(&ctx->destination);
+	struct file *remap_file = file_range_remap_file(ctx->operation, file_in,
+						       file_out);
 
 	ctx->uses_terminal_opt_in = false;
 	if (ctx->use_splice)
@@ -360,9 +396,10 @@ static int file_range_check_terminal_route(struct file_range_context *ctx)
 	if (!file_range_terminal_route_compatible(ctx->operation, file_in,
 						  file_out))
 		return -EXDEV;
-	if (ctx->operation == FILE_RANGE_OPERATION_CLONE &&
-	    !file_in->f_op->remap_file_range)
-		return -EOPNOTSUPP;
+	if (ctx->operation != FILE_RANGE_OPERATION_COPY &&
+	    !remap_file->f_op->remap_file_range)
+		return ctx->operation == FILE_RANGE_OPERATION_DEDUPE ?
+		       -EINVAL : -EOPNOTSUPP;
 	if (!file_range_paired_route(ctx)) {
 		if ((ctx->operation == FILE_RANGE_OPERATION_COPY &&
 		     file_out->f_op->copy_file_range) ||
@@ -425,6 +462,56 @@ static int copy_file_range_checks(struct file *file_in, loff_t pos_in,
 	return 0;
 }
 
+static bool file_range_may_dedupe(struct file *file)
+{
+	struct mnt_idmap *idmap = file_mnt_idmap(file);
+	struct inode *inode = file_inode(file);
+
+	if (capable(CAP_SYS_ADMIN))
+		return true;
+	if (file->f_mode & FMODE_WRITE)
+		return true;
+	if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), current_fsuid()))
+		return true;
+	return !inode_permission(idmap, inode, MAY_WRITE);
+}
+
+static int file_range_get_dedupe_write_access(struct file_range_context *ctx,
+					      unsigned int nr_files)
+{
+	struct file_range_chain *chain = &ctx->destination;
+	int ret;
+
+	while (ctx->nr_write_access_files < nr_files) {
+		unsigned int i = ctx->nr_write_access_files;
+		struct file *file = chain->files[i];
+		bool allowed;
+
+		ret = mnt_get_write_access_file(file);
+		if (ret)
+			return ret;
+		ctx->nr_write_access_files++;
+
+		if (i) {
+			scoped_with_creds(file->f_cred)
+				allowed = file_range_may_dedupe(file);
+		} else {
+			allowed = file_range_may_dedupe(file);
+		}
+		if (!allowed)
+			return -EPERM;
+	}
+
+	return 0;
+}
+
+static bool file_range_contains(struct file *file, loff_t pos, loff_t len)
+{
+	loff_t size = i_size_read(file_inode(file));
+
+	return pos < size && len <= size - pos;
+}
+
 static int file_range_backing_checks(struct file_range_context *ctx,
 				     loff_t len)
 {
@@ -433,7 +520,8 @@ static int file_range_backing_checks(struct file_range_context *ctx,
 	unsigned int i, nr_files;
 	int ret;
 
-	if (destination->files[0]->f_flags & O_APPEND)
+	if (ctx->operation != FILE_RANGE_OPERATION_DEDUPE &&
+	    destination->files[0]->f_flags & O_APPEND)
 		return -EBADF;
 
 	nr_files = max(source->nr_files, destination->nr_files);
@@ -448,16 +536,19 @@ static int file_range_backing_checks(struct file_range_context *ctx,
 		if ((file_in && IS_SWAPFILE(file_inode(file_in))) ||
 		    (file_out && IS_SWAPFILE(file_inode(file_out))))
 			return ctx->uses_terminal_opt_in ? -EXDEV : -ETXTBSY;
-		if (file_in && len) {
-			loff_t size_in = i_size_read(file_inode(file_in));
-
-			if (ctx->pos_in >= size_in ||
-			    len > size_in - (u64)ctx->pos_in)
-				return -EXDEV;
-		}
+		if (file_in && len &&
+		    !file_range_contains(file_in, ctx->pos_in, len))
+			return -EXDEV;
 		if (file_out) {
 			loff_t count = len;
 
+			if (ctx->operation == FILE_RANGE_OPERATION_DEDUPE) {
+				if (len && !file_range_contains(file_out,
+								ctx->pos_out,
+								len))
+					return -EXDEV;
+				continue;
+			}
 			if (file_out->f_flags & O_APPEND)
 				return -EBADF;
 			if (!len)
@@ -474,19 +565,23 @@ static int file_range_backing_checks(struct file_range_context *ctx,
 	return 0;
 }
 
-static int file_range_verify_backing_area(struct file_range_context *ctx,
-					  enum file_range_role role,
-					  struct file *file,
-					  loff_t *pos, loff_t len)
+static int file_range_verify_area(struct file_range_context *ctx,
+				  enum file_range_role role,
+				  struct file *file, loff_t *pos, loff_t len)
 {
-	int read_write = role == FILE_RANGE_SOURCE ? READ : WRITE;
+	int ret;
 
-	if (ctx->operation == FILE_RANGE_OPERATION_COPY)
-		return copy_file_range_verify_backing_area(read_write, file, pos,
-						   len);
+	scoped_with_creds(file->f_cred) {
+		if (ctx->operation == FILE_RANGE_OPERATION_COPY) {
+			int rw = role == FILE_RANGE_SOURCE ? READ : WRITE;
 
-	return remap_verify_area(file, *pos, len,
-				 role == FILE_RANGE_DESTINATION);
+			ret = copy_file_range_verify_backing_area(rw, file, pos, len);
+		} else {
+			ret = remap_verify_area(file, *pos, len,
+						role == FILE_RANGE_DESTINATION);
+		}
+	}
+	return ret;
 }
 
 static int file_range_verify_backing_areas(struct file_range_context *ctx,
@@ -504,20 +599,16 @@ static int file_range_verify_backing_areas(struct file_range_context *ctx,
 		if (i < source->nr_files) {
 			struct file *file = source->files[i];
 
-			scoped_with_creds(file->f_cred)
-				ret = file_range_verify_backing_area(ctx,
-								     FILE_RANGE_SOURCE,
-								     file, &pos_in, len);
+			ret = file_range_verify_area(ctx, FILE_RANGE_SOURCE, file,
+						     &pos_in, len);
 			if (ret)
 				return ret;
 		}
 		if (i < destination->nr_files) {
 			struct file *file = destination->files[i];
 
-			scoped_with_creds(file->f_cred)
-				ret = file_range_verify_backing_area(ctx,
-								     FILE_RANGE_DESTINATION,
-								     file, &pos_out, len);
+			ret = file_range_verify_area(ctx, FILE_RANGE_DESTINATION,
+						     file, &pos_out, len);
 			if (ret)
 				return ret;
 		}
@@ -613,7 +704,7 @@ static s64 copy_file_range_execute_terminal(struct file_range_context *ctx,
 			ret = file_in->f_op->remap_file_range(file_in, ctx->pos_in,
 					file_out, ctx->pos_out, len,
 					REMAP_FILE_CAN_SHORTEN);
-			if (!ret || (ret < 0 && !ctx->uses_terminal_opt_in))
+			if (ret <= 0)
 				ctx->use_splice = true;
 		}
 	}
@@ -704,20 +795,23 @@ static ssize_t copy_file_range_complete(const struct file_range_context *ctx,
 	return ret;
 }
 
-static s64 clone_file_range_execute_terminal(struct file_range_context *ctx,
+static s64 remap_file_range_execute_terminal(struct file_range_context *ctx,
 					     loff_t len)
 {
 	struct file *file_in = file_range_chain_terminal(&ctx->source);
 	struct file *file_out = file_range_chain_terminal(&ctx->destination);
+	struct file *remap_file = file_range_remap_file(ctx->operation, file_in,
+						       file_out);
 	loff_t ret;
 
-	if (!file_in->f_op->remap_file_range)
-		return -EOPNOTSUPP;
+	if (!remap_file->f_op->remap_file_range)
+		return ctx->operation == FILE_RANGE_OPERATION_DEDUPE ?
+		       -EINVAL : -EOPNOTSUPP;
 
 	scoped_guard(super_write, file_inode(file_out)->i_sb)
-		ret = file_in->f_op->remap_file_range(file_in, ctx->pos_in,
-				file_out, ctx->pos_out, len,
-				ctx->operation_flags);
+		ret = remap_file->f_op->remap_file_range(file_in, ctx->pos_in,
+							 file_out, ctx->pos_out,
+							 len, ctx->operation_flags);
 
 	return ret;
 }
@@ -794,10 +888,100 @@ loff_t vfs_clone_file_range(struct file *file_in, loff_t pos_in,
 	}
 
 	ret = file_range_execute(&ctx, 0, len,
-				 clone_file_range_execute_terminal);
+				 remap_file_range_execute_terminal);
 	return clone_file_range_complete(&ctx, file_in, file_out, ret);
 }
 EXPORT_SYMBOL(vfs_clone_file_range);
+
+loff_t vfs_dedupe_file_range_one(struct file *file_in, loff_t pos_in,
+				 struct file *file_out, loff_t pos_out,
+				 loff_t len, unsigned int remap_flags)
+{
+	struct file_range_context ctx __free(file_range_context) = {};
+	bool logical_route_compatible;
+	bool paired_logical_layers;
+	unsigned int nr_files;
+	loff_t ret;
+
+	WARN_ON_ONCE(remap_flags & ~(REMAP_FILE_DEDUP |
+				     REMAP_FILE_CAN_SHORTEN));
+
+	file_range_context_init(&ctx, FILE_RANGE_OPERATION_DEDUPE, file_in,
+				pos_in, file_out, pos_out,
+				remap_flags | REMAP_FILE_DEDUP);
+	paired_logical_layers =
+		file_range_paired_layers(FILE_RANGE_OPERATION_DEDUPE,
+					 file_in, file_out);
+	logical_route_compatible =
+		file_range_logical_route_compatible(&ctx, paired_logical_layers);
+	if (!logical_route_compatible) {
+		ret = file_range_resolve_route(&ctx, FILE_RANGE_RESOLVE_CACHED);
+		if (ret != -EAGAIN && ret)
+			return ret;
+	}
+
+	if (S_ISDIR(file_inode(file_out)->i_mode))
+		return -EISDIR;
+	if (!S_ISREG(file_inode(file_in)->i_mode) ||
+	    !S_ISREG(file_inode(file_out)->i_mode))
+		return -EINVAL;
+
+	ret = remap_verify_area(file_in, pos_in, len, false);
+	if (ret)
+		return ret;
+	ret = remap_verify_area(file_out, pos_out, len, true);
+	if (ret)
+		return ret;
+	if (logical_route_compatible && !paired_logical_layers &&
+	    !file_out->f_op->remap_file_range)
+		return -EINVAL;
+	ret = file_range_get_dedupe_write_access(&ctx, 1);
+	if (ret)
+		return ret;
+
+	if (!logical_route_compatible || paired_logical_layers) {
+		ret = file_range_resolve_route(&ctx,
+					       FILE_RANGE_RESOLVE_MAY_OPEN);
+		if (ret)
+			return ret;
+	}
+
+	if (file_range_has_backing_files(&ctx)) {
+		if (!len) {
+			ret = file_range_verify_backing_areas(&ctx, 0);
+			if (ret)
+				return ret;
+			ret = file_range_revalidate_destination(&ctx);
+			if (ret)
+				return ret;
+			nr_files = ctx.destination.nr_files;
+			return file_range_get_dedupe_write_access(&ctx,
+							  nr_files);
+		}
+		ret = file_range_backing_checks(&ctx, len);
+		if (ret)
+			return ret;
+		ret = file_range_verify_backing_areas(&ctx, len);
+		if (ret)
+			return ret;
+		ret = file_range_revalidate_destination(&ctx);
+		if (ret)
+			return ret;
+		ret = file_range_backing_checks(&ctx, len);
+		if (ret)
+			return ret;
+		nr_files = ctx.destination.nr_files;
+		ret = file_range_get_dedupe_write_access(&ctx, nr_files);
+		if (ret)
+			return ret;
+	}
+	if (!len)
+		return 0;
+
+	return file_range_execute(&ctx, 0, len,
+				  remap_file_range_execute_terminal);
+}
+EXPORT_SYMBOL(vfs_dedupe_file_range_one);
 
 ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 			    struct file *file_out, loff_t pos_out,
