@@ -801,6 +801,19 @@ static int warn_unsupported_splice(struct file *file, const char *op)
 	return -EINVAL;
 }
 
+bool file_can_splice_read(struct file *file)
+{
+	const struct file_range_layer_operations *ops;
+
+	if (file->f_op->splice_read)
+		return true;
+
+	ops = file->f_op->file_range_layer_ops;
+	return ops &&
+	       ops->supported_operations & BIT(FILE_RANGE_OPERATION_SPLICE);
+}
+EXPORT_SYMBOL_GPL(file_can_splice_read);
+
 static ssize_t
 file_range_splice_read_terminal(struct file *file, loff_t *ppos,
 				struct pipe_inode_info *pipe, size_t len,

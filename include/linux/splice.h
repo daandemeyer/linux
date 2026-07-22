@@ -79,6 +79,7 @@ ssize_t add_to_pipe(struct pipe_inode_info *pipe, struct pipe_buffer *buf);
 ssize_t vfs_splice_read(struct file *in, loff_t *ppos,
 			struct pipe_inode_info *pipe, size_t len,
 			unsigned int flags);
+bool file_can_splice_read(struct file *file);
 ssize_t splice_direct_to_actor(struct file *file, struct splice_desc *sd,
 			       splice_direct_actor *actor);
 ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,

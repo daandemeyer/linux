@@ -587,8 +587,6 @@ const struct file_operations ovl_file_operations = {
 	.fallocate	= ovl_fallocate,
 	.fadvise	= ovl_fadvise,
 	.flush		= ovl_flush,
-	.splice_read    = filemap_splice_read,
-	.splice_write   = iter_file_splice_write,
 
 	.file_range_layer_ops	= &ovl_file_range_layer_ops,
 	.setlease		= generic_setlease,
