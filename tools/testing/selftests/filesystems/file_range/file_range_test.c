@@ -210,6 +210,38 @@ static int clone_range_once(const char *source, const char *destination,
 	return ioctl(destination_fd, FICLONERANGE, &range) ? -errno : 0;
 }
 
+static int dedupe_range_once(const char *source, const char *destination,
+			     loff_t pos_in, loff_t pos_out, uint64_t len)
+{
+	struct file_dedupe_range *range;
+	int ret;
+
+	int source_fd __free(close_fd) = open(source, O_RDONLY | O_CLOEXEC);
+
+	if (source_fd < 0)
+		return -errno;
+
+	int destination_fd __free(close_fd) =
+		open(destination, O_RDONLY | O_CLOEXEC);
+
+	if (destination_fd < 0)
+		return -errno;
+	range = calloc(1, sizeof(*range) + sizeof(range->info[0]));
+	if (!range)
+		return -ENOMEM;
+	range->src_offset = pos_in;
+	range->src_length = len;
+	range->dest_count = 1;
+	range->info[0].dest_fd = destination_fd;
+	range->info[0].dest_offset = pos_out;
+	if (ioctl(source_fd, FIDEDUPERANGE, range))
+		ret = -errno;
+	else
+		ret = range->info[0].status;
+	free(range);
+	return ret;
+}
+
 static void cleanup_fixture(struct _test_data_file_range *self)
 {
 	char merged[PATH_MAX];
@@ -575,6 +607,53 @@ TEST_F(file_range, clone_reaches_terminal_filesystem)
 	EXPECT_EQ(-EOPNOTSUPP, ret);
 	ASSERT_EQ(0, stat(destination, &st));
 	EXPECT_EQ(0, st.st_size);
+}
+
+TEST_F(file_range, dedupe_does_not_copy_up_source)
+{
+	char logical_lower[PATH_MAX], upper_source[PATH_MAX];
+	char dedupe_destination[PATH_MAX];
+	int error, ret;
+
+	ASSERT_EQ(0, make_path(logical_lower, sizeof(logical_lower), self->root,
+			       "merged/data"));
+	ASSERT_EQ(0, make_path(upper_source, sizeof(upper_source), self->root,
+			       "upper/data"));
+	ASSERT_EQ(0, make_path(dedupe_destination,
+			       sizeof(dedupe_destination), self->root,
+			       "merged/dedupe-destination"));
+	ASSERT_EQ(0, create_pattern_file(dedupe_destination, 0x61, FILE_SIZE));
+	ret = access(upper_source, F_OK);
+	error = errno;
+	ASSERT_EQ(-1, ret);
+	ASSERT_EQ(ENOENT, error);
+
+	/* Dedupe must not copy up a lower-only OverlayFS source. */
+	ret = dedupe_range_once(logical_lower, dedupe_destination, 0, 0,
+				FILE_SIZE);
+	EXPECT_EQ(-EPERM, ret);
+	ret = access(upper_source, F_OK);
+	error = errno;
+	EXPECT_EQ(-1, ret);
+	EXPECT_EQ(ENOENT, error);
+}
+
+TEST_F(file_range, dedupe_reaches_terminal_filesystem)
+{
+	char source[PATH_MAX], destination[PATH_MAX];
+	int ret;
+
+	ASSERT_EQ(0, make_path(source, sizeof(source), self->root,
+			       "merged/dedupe-source"));
+	ASSERT_EQ(0, make_path(destination, sizeof(destination), self->root,
+			       "merged/dedupe-destination-unsupported"));
+	ASSERT_EQ(0, create_pattern_file(source, 0x64, FILE_SIZE));
+	ASSERT_EQ(0, create_pattern_file(destination, 0x64, FILE_SIZE));
+
+	/* Upper files resolve before tmpfs rejects dedupe support. */
+	ret = dedupe_range_once(source, destination, 0, 0, FILE_SIZE);
+	EXPECT_EQ(-EINVAL, ret);
+	EXPECT_EQ(0, compare_files(source, destination));
 }
 
 static bool fanotify_unavailable(int error)
