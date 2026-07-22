@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/fs.h>
 #include <linux/fuse.h>
 #include <linux/limits.h>
 #include <linux/magic.h>
@@ -552,6 +553,28 @@ static ssize_t copy_once(const char *source, const char *destination,
 	return ret;
 }
 
+static int clone_once(const char *source, const char *destination, size_t len)
+{
+	struct file_clone_range range = { .src_length = len };
+	int source_fd, destination_fd;
+	int ret;
+
+	source_fd = open(source, O_RDONLY | O_CLOEXEC);
+	if (source_fd < 0)
+		return -errno;
+	destination_fd = open(destination, O_WRONLY | O_CLOEXEC);
+	if (destination_fd < 0) {
+		ret = -errno;
+		close(source_fd);
+		return ret;
+	}
+	range.src_fd = source_fd;
+	ret = ioctl(destination_fd, FICLONERANGE, &range) ? -errno : 0;
+	close(destination_fd);
+	close(source_fd);
+	return ret;
+}
+
 static int compare_range(const char *source, const char *destination,
 			 loff_t pos_in, loff_t pos_out, size_t len)
 {
@@ -861,6 +884,43 @@ TEST_F(fuse_passthrough, per_open_method_selection)
 	ASSERT_EQ((ssize_t)4096, ret);
 	ASSERT_EQ(0, compare_range(self->paths[NODE_MIXED],
 				   self->paths[NODE_MIXED], 0, TEST_SIZE, 4096));
+}
+
+TEST_F(fuse_passthrough, clone_method_selection)
+{
+	char src[PATH_MAX], dst[PATH_MAX], server[PATH_MAX];
+	char direct[PATH_MAX], mixed[PATH_MAX];
+	const char *plain_source = self->paths[NODE_COUNT];
+	const char *plain_output = self->paths[NODE_COUNT + 1];
+	struct stat st;
+
+	ASSERT_EQ(0, logical_path(self->mountpoint, "src", src, sizeof(src)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "dst", dst, sizeof(dst)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "server", server,
+				  sizeof(server)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "direct", direct,
+				  sizeof(direct)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "mixed", mixed,
+				  sizeof(mixed)));
+
+	ASSERT_EQ(0, truncate(self->paths[NODE_DST], 0));
+	ASSERT_EQ(-EOPNOTSUPP, clone_once(src, dst, TEST_SIZE));
+	ASSERT_EQ(0, stat(self->paths[NODE_DST], &st));
+	ASSERT_EQ(0, st.st_size);
+
+	ASSERT_EQ(0, truncate(plain_output, 0));
+	ASSERT_EQ(-EOPNOTSUPP, clone_once(src, plain_output, TEST_SIZE));
+	ASSERT_EQ(-EOPNOTSUPP, clone_once(plain_source, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, clone_once(server, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, clone_once(direct, dst, TEST_SIZE));
+	ASSERT_EQ(-EOPNOTSUPP, clone_once(mixed, dst, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, clone_once(src, server, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, clone_once(src, direct, TEST_SIZE));
+	ASSERT_EQ(-EXDEV, clone_once(src, mixed, TEST_SIZE));
+	ASSERT_EQ(0, stat(self->paths[NODE_DST], &st));
+	ASSERT_EQ(0, st.st_size);
+	ASSERT_EQ(0, stat(plain_output, &st));
+	ASSERT_EQ(0, st.st_size);
 }
 
 TEST_F(fuse_passthrough, source_atime)
