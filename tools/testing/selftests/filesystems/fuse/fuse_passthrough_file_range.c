@@ -609,6 +609,58 @@ static int dedupe_once(const char *source, const char *destination, size_t len)
 	return ret;
 }
 
+static ssize_t splice_once(const char *source, const char *destination,
+			   size_t len)
+{
+	loff_t pos_in = 0, pos_out = 0;
+	int pipefd[2], source_fd, destination_fd;
+	ssize_t copied = 0, ret;
+
+	source_fd = open(source, O_RDONLY | O_CLOEXEC);
+	if (source_fd < 0)
+		return -errno;
+	destination_fd = open(destination, O_WRONLY | O_CLOEXEC);
+	if (destination_fd < 0) {
+		ret = -errno;
+		goto out_source;
+	}
+	if (pipe2(pipefd, O_CLOEXEC)) {
+		ret = -errno;
+		goto out_destination;
+	}
+
+	while ((size_t)copied < len) {
+		ssize_t pending, written = 0;
+
+		pending = splice(source_fd, &pos_in, pipefd[1], NULL,
+				 len - copied, 0);
+		if (pending <= 0) {
+			ret = pending < 0 ? -errno : copied;
+			goto out_pipe;
+		}
+		while (written < pending) {
+			ssize_t bytes = splice(pipefd[0], NULL, destination_fd,
+					       &pos_out, pending - written, 0);
+
+			if (bytes <= 0) {
+				ret = bytes < 0 ? -errno : -EIO;
+				goto out_pipe;
+			}
+			written += bytes;
+		}
+		copied += pending;
+	}
+	ret = copied;
+out_pipe:
+	close(pipefd[1]);
+	close(pipefd[0]);
+out_destination:
+	close(destination_fd);
+out_source:
+	close(source_fd);
+	return ret;
+}
+
 static int compare_range(const char *source, const char *destination,
 			 loff_t pos_in, loff_t pos_out, size_t len)
 {
@@ -987,6 +1039,47 @@ TEST_F(fuse_passthrough, dedupe_method_selection)
 	ASSERT_EQ(-EINVAL, dedupe_once(src, mixed, TEST_SIZE));
 	ASSERT_EQ(0, read_range(self->paths[NODE_DST], after, sizeof(after), 0));
 	ASSERT_EQ(0, memcmp(before, after, sizeof(before)));
+}
+
+TEST_F(fuse_passthrough, splice_per_open_method_selection)
+{
+	char src[PATH_MAX], dst[PATH_MAX], server[PATH_MAX], direct[PATH_MAX];
+	const char *plain_source = self->paths[NODE_COUNT];
+	const char *plain_output = self->paths[NODE_COUNT + 1];
+
+	ASSERT_EQ(0, logical_path(self->mountpoint, "src", src, sizeof(src)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "dst", dst, sizeof(dst)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "server", server,
+				  sizeof(server)));
+	ASSERT_EQ(0, logical_path(self->mountpoint, "direct", direct,
+				  sizeof(direct)));
+
+	/* Passthrough splice reads and writes resolve to the backing files. */
+	ASSERT_EQ(0, truncate(plain_output, 0));
+	ASSERT_EQ((ssize_t)TEST_SIZE,
+		  splice_once(src, plain_output, TEST_SIZE));
+	ASSERT_EQ(0, compare_range(self->paths[NODE_SRC], plain_output,
+				   0, 0, TEST_SIZE));
+	ASSERT_EQ(0, truncate(self->paths[NODE_DST], 0));
+	ASSERT_EQ((ssize_t)TEST_SIZE, splice_once(plain_source, dst, TEST_SIZE));
+	ASSERT_EQ(0, compare_range(plain_source, self->paths[NODE_DST],
+				   0, 0, TEST_SIZE));
+	ASSERT_EQ(0, truncate(self->paths[NODE_DST], 0));
+	ASSERT_EQ((ssize_t)TEST_SIZE, splice_once(src, dst, TEST_SIZE));
+	ASSERT_EQ(0, compare_range(self->paths[NODE_SRC], self->paths[NODE_DST],
+				   0, 0, TEST_SIZE));
+
+	/* Server-backed and direct-I/O opens retain their FUSE splice path. */
+	ASSERT_EQ(0, truncate(plain_output, 0));
+	ASSERT_EQ((ssize_t)TEST_SIZE,
+		  splice_once(server, plain_output, TEST_SIZE));
+	ASSERT_EQ(0, compare_range(self->paths[NODE_SERVER], plain_output,
+				   0, 0, TEST_SIZE));
+	ASSERT_EQ(0, truncate(self->paths[NODE_DIRECT], 0));
+	ASSERT_EQ((ssize_t)TEST_SIZE,
+		  splice_once(plain_source, direct, TEST_SIZE));
+	ASSERT_EQ(0, compare_range(plain_source, self->paths[NODE_DIRECT],
+				   0, 0, TEST_SIZE));
 }
 
 TEST_F(fuse_passthrough, source_atime)
